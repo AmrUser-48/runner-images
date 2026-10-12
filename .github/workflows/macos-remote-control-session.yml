@@ -199,7 +199,10 @@ jobs:
           } | tee -a "$log" | tee -a "$REPORT_DIR/remote-access.txt"
 
           if [[ "$vnc_ready" == true ]]; then
-            echo 'VNC status: TCP 5900 is listening on the Tailscale address.' | tee -a "$GITHUB_STEP_SUMMARY"
+            {
+              echo 'VNC transport: TCP 5900 accepts connections on the Tailscale address.'
+              echo 'VNC desktop status: NOT VERIFIED. A headless macOS runner may accept VNC authentication but fail to provide a framebuffer if Screen Recording authorization is unavailable.'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           else
             {
               echo 'VNC status: NOT READY. Screen Sharing may require GUI/MDM authorization on this macOS image.'
@@ -304,7 +307,8 @@ jobs:
             echo "- Runner label: ${{ inputs.runner_label || 'macos-15-intel' }}"
             echo "- macOS user: $remote_user"
             echo "- Tailscale IPv4: $TAILSCALE_IP"
-            echo "- Screen Sharing/VNC status: $vnc_status"
+            echo "- Screen Sharing/VNC TCP listener: $vnc_status"
+            echo '- VNC desktop/framebuffer: not verified by a port check; macOS Screen Recording authorization may be unavailable on a headless runner.'
             echo "- SSH status: $ssh_status"
             echo "- VNC host: $TAILSCALE_IP, TCP port 5900 (password: GitHub Actions secret VNC_PASSWORD)"
             echo "- macOS Screen Sharing URI: vnc://$TAILSCALE_IP"
