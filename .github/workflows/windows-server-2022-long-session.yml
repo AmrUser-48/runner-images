@@ -1,5 +1,5 @@
 name: Windows Server 2022 — Long Session
-run-name: "Windows Server 2022 • ${{ inputs.session_minutes || 350 }} minute session"
+run-name: "Windows Server 2022 SSH + VNC • ${{ inputs.session_minutes || 350 }} minutes"
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   windows-session:
-    name: Start Windows Server 2022 (maximum hosted-runner duration)
+    name: Windows Server 2022 with private SSH and VNC
     runs-on: windows-2022
     timeout-minutes: 360
 
@@ -54,142 +54,7 @@ jobs:
             throw "Configure these repository Actions secrets first: $($missing -join ', '). See README section 'Windows Server 2022 SSH + VNC access'. Secret values are never printed."
           }
           if ($env:REMOTE_PASSWORD.Length -lt 14) { throw 'REMOTE_PASSWORD must be at least 14 characters long.' }
-          if ($env:VNC_PASSWORD -notmatch '^[A-Za-z0-9]{8}        id: host
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $reportDir = Join-Path $env:RUNNER_TEMP 'windows-2022-session'
-          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
-          "REPORT_DIR=$reportDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          $os = Get-CimInstance Win32_OperatingSystem
-          $computer = Get-CimInstance Win32_ComputerSystem
-          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-          $memoryGiB = [Math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
-          $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
-            Select-Object DeviceID,
-              @{Name='SizeGiB';Expression={[Math]::Round($_.Size / 1GB, 1)}},
-              @{Name='FreeGiB';Expression={[Math]::Round($_.FreeSpace / 1GB, 1)}}
-
-          $report = @(
-            'Windows Server 2022 hosted runner session'
-            "UTC start: $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "Computer: $env:COMPUTERNAME"
-            "OS: $($os.Caption)"
-            "Version/build: $($os.Version) / $($os.BuildNumber)"
-            "Boot time: $($os.LastBootUpTime)"
-            "Architecture: $env:PROCESSOR_ARCHITECTURE"
-            "CPU: $($cpu.Name)"
-            "Logical processors: $($computer.NumberOfLogicalProcessors)"
-            "Memory GiB: $memoryGiB"
-            ''
-            'Local disks:'
-            ($disks | Format-Table -AutoSize | Out-String -Width 160)
-            'Notes: This is an ephemeral GitHub-hosted CI virtual machine.'
-            'It is not a persistent VM and no inbound RDP or remote-access tunnel is configured.'
-          )
-          $report | Tee-Object -FilePath (Join-Path $reportDir 'runner-report.txt')
-          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          use-cache: "false"
-
-      - name: Enable Windows OpenSSH Server
-        shell: pwsh
-        env:
-          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
-          $capability = Get-WindowsCapability -Online -Name $capabilityName
-          if ($capability.State -ne 'Installed') {
-            Add-WindowsCapability -Online -Name $capabilityName | Out-Null
-          }
-
-          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
-          $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
-          $securePassword = ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force
-          Set-LocalUser -Name $remoteUser -Password $securePassword
-          if (-not $localUser.Enabled) { Enable-LocalUser -Name $remoteUser }
-
-          $configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
-          if (-not (Test-Path $configPath)) { throw "OpenSSH config was not created: $configPath" }
-          $config = Get-Content -LiteralPath $configPath -Raw
-          $match = [regex]::Match($config, '(?im)^[ \t]*Match[ \t]+')
-          if ($match.Success) {
-            $prefix = $config.Substring(0, $match.Index)
-            $suffix = $config.Substring($match.Index)
-          } else {
-            $prefix = $config
-            $suffix = ''
-          }
-          $passwordAuthPattern = '(?im)^[ \t]*#?[ \t]*PasswordAuthentication[ \t]+\S+.*        id: session
-        shell: pwsh
-        timeout-minutes: 355
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $sessionMinutes = 0
-          $heartbeatMinutes = 0
-          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$sessionMinutes)) {
-            throw 'session_minutes must be an integer.'
-          }
-          if (-not [int]::TryParse($env:HEARTBEAT_MINUTES, [ref]$heartbeatMinutes)) {
-            throw 'heartbeat_minutes must be an integer.'
-          }
-          if ($sessionMinutes -lt 1 -or $sessionMinutes -gt 350) {
-            throw 'session_minutes must be between 1 and 350 to leave time for final reporting before the 360-minute job timeout.'
-          }
-          if ($heartbeatMinutes -notin @(1, 5, 10, 15)) {
-            throw 'heartbeat_minutes must be one of 1, 5, 10, or 15.'
-          }
-
-          $log = Join-Path $env:REPORT_DIR 'heartbeat.log'
-          $started = [DateTime]::UtcNow
-          $deadline = $started.AddMinutes($sessionMinutes)
-          "Started UTC=$($started.ToString('o')); target minutes=$sessionMinutes; heartbeat minutes=$heartbeatMinutes" |
-            Tee-Object -FilePath $log
-          "Session target: $sessionMinutes minutes. The job hard timeout is 360 minutes." |
-            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-          while ($true) {
-            $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
-            if ($remaining -le 0) { break }
-
-            $sleepSeconds = [int][Math]::Min($heartbeatMinutes * 60, $remaining)
-            Start-Sleep -Seconds $sleepSeconds
-
-            $now = [DateTime]::UtcNow
-            $remainingMinutes = [Math]::Max(0, [Math]::Ceiling(($deadline - $now).TotalMinutes))
-            $line = "Heartbeat UTC=$($now.ToString('o')); remaining_minutes=$remainingMinutes"
-            Add-Content -Path $log -Value $line -Encoding utf8
-            Write-Host $line
-          }
-
-          $ended = [DateTime]::UtcNow
-          "Ended UTC=$($ended.ToString('o')); elapsed_minutes=$([Math]::Round(($ended - $started).TotalMinutes, 2))" |
-            Tee-Object -FilePath $log -Append
-          @(
-            ''
-            '## Session completed'
-            "- Started: $($started.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Ended: $($ended.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Requested duration: $sessionMinutes minutes"
-            "- Heartbeat interval: $heartbeatMinutes minutes"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Upload session diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-2022-session-${{ github.run_id }}
-          path: ${{ runner.temp }}/windows-2022-session/
-          if-no-files-found: warn
-          retention-days: 1
-          compression-level: 1
-) {
+          if ($env:VNC_PASSWORD -notmatch '^[A-Za-z0-9]{8}$') {
             throw 'VNC_PASSWORD must be exactly 8 ASCII letters/digits.'
           }
           Write-Host 'Required secrets are present; password formats are valid.'
@@ -226,77 +91,48 @@ jobs:
             ''
             'Local disks:'
             ($disks | Format-Table -AutoSize | Out-String -Width 160)
-            'Notes: This is an ephemeral GitHub-hosted CI virtual machine.'
-            'It is not a persistent VM and no inbound RDP or remote-access tunnel is configured.'
+            'Network access: private Tailscale overlay only; no public SSH/VNC port forwarding.'
+            'This is an ephemeral GitHub-hosted CI machine; it is discarded after the job ends.'
           )
           $report | Tee-Object -FilePath (Join-Path $reportDir 'runner-report.txt')
           $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Keep the session active with periodic heartbeats
-        id: session
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: "false"
+
+      - name: Enable Windows OpenSSH Server
         shell: pwsh
-        timeout-minutes: 355
+        env:
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $sessionMinutes = 0
-          $heartbeatMinutes = 0
-          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$sessionMinutes)) {
-            throw 'session_minutes must be an integer.'
-          }
-          if (-not [int]::TryParse($env:HEARTBEAT_MINUTES, [ref]$heartbeatMinutes)) {
-            throw 'heartbeat_minutes must be an integer.'
-          }
-          if ($sessionMinutes -lt 1 -or $sessionMinutes -gt 350) {
-            throw 'session_minutes must be between 1 and 350 to leave time for final reporting before the 360-minute job timeout.'
-          }
-          if ($heartbeatMinutes -notin @(1, 5, 10, 15)) {
-            throw 'heartbeat_minutes must be one of 1, 5, 10, or 15.'
+          $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
+          $capability = Get-WindowsCapability -Online -Name $capabilityName
+          if ($capability.State -ne 'Installed') {
+            Add-WindowsCapability -Online -Name $capabilityName | Out-Null
           }
 
-          $log = Join-Path $env:REPORT_DIR 'heartbeat.log'
-          $started = [DateTime]::UtcNow
-          $deadline = $started.AddMinutes($sessionMinutes)
-          "Started UTC=$($started.ToString('o')); target minutes=$sessionMinutes; heartbeat minutes=$heartbeatMinutes" |
-            Tee-Object -FilePath $log
-          "Session target: $sessionMinutes minutes. The job hard timeout is 360 minutes." |
-            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
+          $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
+          $securePassword = ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force
+          Set-LocalUser -Name $remoteUser -Password $securePassword
+          if (-not $localUser.Enabled) { Enable-LocalUser -Name $remoteUser }
 
-          while ($true) {
-            $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
-            if ($remaining -le 0) { break }
-
-            $sleepSeconds = [int][Math]::Min($heartbeatMinutes * 60, $remaining)
-            Start-Sleep -Seconds $sleepSeconds
-
-            $now = [DateTime]::UtcNow
-            $remainingMinutes = [Math]::Max(0, [Math]::Ceiling(($deadline - $now).TotalMinutes))
-            $line = "Heartbeat UTC=$($now.ToString('o')); remaining_minutes=$remainingMinutes"
-            Add-Content -Path $log -Value $line -Encoding utf8
-            Write-Host $line
+          $configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
+          if (-not (Test-Path $configPath)) { throw "OpenSSH config was not created: $configPath" }
+          $config = Get-Content -LiteralPath $configPath -Raw
+          $match = [regex]::Match($config, '(?im)^[ \t]*Match[ \t]+')
+          if ($match.Success) {
+            $prefix = $config.Substring(0, $match.Index)
+            $suffix = $config.Substring($match.Index)
+          } else {
+            $prefix = $config
+            $suffix = ''
           }
-
-          $ended = [DateTime]::UtcNow
-          "Ended UTC=$($ended.ToString('o')); elapsed_minutes=$([Math]::Round(($ended - $started).TotalMinutes, 2))" |
-            Tee-Object -FilePath $log -Append
-          @(
-            ''
-            '## Session completed'
-            "- Started: $($started.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Ended: $($ended.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Requested duration: $sessionMinutes minutes"
-            "- Heartbeat interval: $heartbeatMinutes minutes"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Upload session diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-2022-session-${{ github.run_id }}
-          path: ${{ runner.temp }}/windows-2022-session/
-          if-no-files-found: warn
-          retention-days: 1
-          compression-level: 1
-
+          $passwordAuthPattern = '(?im)^[ \t]*#?[ \t]*PasswordAuthentication[ \t]+\S+.*$'
           if ([regex]::IsMatch($prefix, $passwordAuthPattern)) {
             $prefix = [regex]::Replace($prefix, $passwordAuthPattern, 'PasswordAuthentication yes')
           } else {
@@ -395,7 +231,7 @@ jobs:
           $tailnetIp = (& $tailscalePath ip -4 | Where-Object { $_ -match '^100\.' } | Select-Object -First 1)
           if (-not $tailnetIp) { throw 'Tailscale did not report a 100.x IPv4 address.' }
           $tailnetIp = $tailnetIp.Trim()
-          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
+          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
 
           $lines = @(
             ''
@@ -417,7 +253,6 @@ jobs:
           Write-Host 'Connection passwords are intentionally not printed.'
 
       - name: Keep the session active with periodic heartbeats
-
         id: session
         shell: pwsh
         timeout-minutes: 355
@@ -449,117 +284,8 @@ jobs:
           while ($true) {
             $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
             if ($remaining -le 0) { break }
-
             $sleepSeconds = [int][Math]::Min($heartbeatMinutes * 60, $remaining)
             Start-Sleep -Seconds $sleepSeconds
-
-            $now = [DateTime]::UtcNow
-            $remainingMinutes = [Math]::Max(0, [Math]::Ceiling(($deadline - $now).TotalMinutes))
-            $line = "Heartbeat UTC=$($now.ToString('o')); remaining_minutes=$remainingMinutes"
-            Add-Content -Path $log -Value $line -Encoding utf8
-            Write-Host $line
-          }
-
-          $ended = [DateTime]::UtcNow
-          "Ended UTC=$($ended.ToString('o')); elapsed_minutes=$([Math]::Round(($ended - $started).TotalMinutes, 2))" |
-            Tee-Object -FilePath $log -Append
-          @(
-            ''
-            '## Session completed'
-            "- Started: $($started.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Ended: $($ended.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "- Requested duration: $sessionMinutes minutes"
-            "- Heartbeat interval: $heartbeatMinutes minutes"
-          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Upload session diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-2022-session-${{ github.run_id }}
-          path: ${{ runner.temp }}/windows-2022-session/
-          if-no-files-found: warn
-          retention-days: 1
-          compression-level: 1
-) {
-            throw 'VNC_PASSWORD must be exactly 8 ASCII letters/digits.'
-          }
-          Write-Host 'Required secrets are present; password formats are valid.'
-
-      - name: Identify the Windows host
-        id: host
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $reportDir = Join-Path $env:RUNNER_TEMP 'windows-2022-session'
-          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
-          "REPORT_DIR=$reportDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          $os = Get-CimInstance Win32_OperatingSystem
-          $computer = Get-CimInstance Win32_ComputerSystem
-          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-          $memoryGiB = [Math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
-          $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
-            Select-Object DeviceID,
-              @{Name='SizeGiB';Expression={[Math]::Round($_.Size / 1GB, 1)}},
-              @{Name='FreeGiB';Expression={[Math]::Round($_.FreeSpace / 1GB, 1)}}
-
-          $report = @(
-            'Windows Server 2022 hosted runner session'
-            "UTC start: $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ssZ'))"
-            "Computer: $env:COMPUTERNAME"
-            "OS: $($os.Caption)"
-            "Version/build: $($os.Version) / $($os.BuildNumber)"
-            "Boot time: $($os.LastBootUpTime)"
-            "Architecture: $env:PROCESSOR_ARCHITECTURE"
-            "CPU: $($cpu.Name)"
-            "Logical processors: $($computer.NumberOfLogicalProcessors)"
-            "Memory GiB: $memoryGiB"
-            ''
-            'Local disks:'
-            ($disks | Format-Table -AutoSize | Out-String -Width 160)
-            'Notes: This is an ephemeral GitHub-hosted CI virtual machine.'
-            'It is not a persistent VM and no inbound RDP or remote-access tunnel is configured.'
-          )
-          $report | Tee-Object -FilePath (Join-Path $reportDir 'runner-report.txt')
-          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Keep the session active with periodic heartbeats
-        id: session
-        shell: pwsh
-        timeout-minutes: 355
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $sessionMinutes = 0
-          $heartbeatMinutes = 0
-          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$sessionMinutes)) {
-            throw 'session_minutes must be an integer.'
-          }
-          if (-not [int]::TryParse($env:HEARTBEAT_MINUTES, [ref]$heartbeatMinutes)) {
-            throw 'heartbeat_minutes must be an integer.'
-          }
-          if ($sessionMinutes -lt 1 -or $sessionMinutes -gt 350) {
-            throw 'session_minutes must be between 1 and 350 to leave time for final reporting before the 360-minute job timeout.'
-          }
-          if ($heartbeatMinutes -notin @(1, 5, 10, 15)) {
-            throw 'heartbeat_minutes must be one of 1, 5, 10, or 15.'
-          }
-
-          $log = Join-Path $env:REPORT_DIR 'heartbeat.log'
-          $started = [DateTime]::UtcNow
-          $deadline = $started.AddMinutes($sessionMinutes)
-          "Started UTC=$($started.ToString('o')); target minutes=$sessionMinutes; heartbeat minutes=$heartbeatMinutes" |
-            Tee-Object -FilePath $log
-          "Session target: $sessionMinutes minutes. The job hard timeout is 360 minutes." |
-            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-          while ($true) {
-            $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
-            if ($remaining -le 0) { break }
-
-            $sleepSeconds = [int][Math]::Min($heartbeatMinutes * 60, $remaining)
-            Start-Sleep -Seconds $sleepSeconds
-
             $now = [DateTime]::UtcNow
             $remainingMinutes = [Math]::Max(0, [Math]::Ceiling(($deadline - $now).TotalMinutes))
             $line = "Heartbeat UTC=$($now.ToString('o')); remaining_minutes=$remainingMinutes"
