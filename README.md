@@ -258,7 +258,8 @@ The [Windows Server 2022 workflow](.github/workflows/windows-server-2022-long-se
 3. Create a Tailscale auth key with the `tag:ci` identity, **Reusable** and **Ephemeral** enabled, and pre-approve it if your tailnet enforces device approval. Store it as repository secret `TAILSCALE_AUTHKEY`.
 4. In GitHub, open **Settings → Secrets and variables → Actions** for this repository and create these repository secrets:
    - `TAILSCALE_AUTHKEY`: the tagged Tailscale auth key described above.
-   - `REMOTE_PASSWORD`: a strong password of at least 14 characters for the workflow's Windows account.
+   - `SSH_PUBLIC_KEY`: your single-line OpenSSH public key (for example, the contents of `~/.ssh/id_ed25519_macos_runner.pub`). The workflow installs it for key-only SSH and disables SSH password authentication.
+   - `REMOTE_PASSWORD` (optional but useful for logging into the Windows desktop): a strong password of at least 16 characters containing uppercase, lowercase, numeric, and special characters.
    - `VNC_PASSWORD`: exactly 8 ASCII letters or digits. Classic VNC authentication only supports a short password; Tailscale access controls remain the main network boundary.
 
 ### Start and connect
@@ -267,8 +268,15 @@ Open **Actions → Windows Server 2022 — Long Session → Run workflow**. Sele
 
 From a device connected to the same Tailscale network, use the reported values:
 
-- SSH: `ssh WINDOWS_USER@TAILSCALE_IP` (password is the `REMOTE_PASSWORD` secret).
-- VNC: set the viewer host to `TAILSCALE_IP` and port to `5900`; on Linux with TigerVNC use `vncviewer TAILSCALE_IP::5900` (password is the `VNC_PASSWORD` secret).
+- SSH: `ssh -i ~/.ssh/id_ed25519_macos_runner -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no WINDOWS_USER@TAILSCALE_IP`. The key must match `SSH_PUBLIC_KEY`; SSH password authentication is disabled.
+- VNC: use the reported host and TCP port `5900`. TigerVNC cannot authenticate with an SSH key directly, but you can store the shared `VNC_PASSWORD` locally once so the viewer does not prompt on every connection:
+  ```bash
+  mkdir -p ~/.vnc && chmod 700 ~/.vnc
+  vncpasswd ~/.vnc/passwd
+  chmod 600 ~/.vnc/passwd
+  vncviewer -passwd ~/.vnc/passwd TAILSCALE_IP::5900
+  ```
+  Enter the `VNC_PASSWORD` when `vncpasswd` prompts once. Keep the password file private; it can be used for both the Windows and macOS workflows because they share the same `VNC_PASSWORD` secret.
 
 The run has a 360-minute hard timeout and cancels any previous session when a new one starts. This remains an ephemeral GitHub-hosted CI machine, not a persistent VM: the Tailscale node and remote access disappear when the job ends.
 
@@ -297,7 +305,8 @@ From a device connected to the same Tailscale network:
 
 - VNC: connect to the reported Tailscale IPv4 address on TCP port `5900`; with TigerVNC on Linux, run `vncviewer TAILSCALE_IP::5900`. Use the `VNC_PASSWORD` secret.
 - On macOS, open `vnc://TAILSCALE_IP` in Screen Sharing.
-- SSH (if configured): `ssh -i ~/.ssh/id_ed25519_macos_runner -o IdentitiesOnly=yes MACOS_USER@TAILSCALE_IP`; authenticate with the private key that matches `SSH_PUBLIC_KEY`.
+- SSH: `ssh -i ~/.ssh/id_ed25519_macos_runner -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no MACOS_USER@TAILSCALE_IP`; authenticate with the private key matching `SSH_PUBLIC_KEY`.
+- VNC without repeated password prompts: use the TigerVNC password file instructions in the Windows Server 2022 section above. The same `VNC_PASSWORD` secret is used by both remote-access workflows.
 
 ### macOS Screen Sharing limitation
 
