@@ -231,28 +231,52 @@ jobs:
             remote_user="$(id -un)"
             ssh_dir="$HOME/.ssh"
             authorized_keys="$ssh_dir/authorized_keys"
+            sshd_config='/etc/ssh/sshd_config'
 
             # Install the public key; the private key stays on the client.
             install -d -m 700 "$ssh_dir"
             printf '%s\n' "$SSH_PUBLIC_KEY" > "$authorized_keys"
             chmod 600 "$authorized_keys"
-            ssh-keygen -lf "$authorized_keys" > "$RUNNER_TEMP/ssh-key-fingerprints.txt"
-            awk '{ print "Installed SSH public-key fingerprint: " $2 }' "$RUNNER_TEMP/ssh-key-fingerprints.txt"
+            key_fingerprint="$(ssh-keygen -lf "$authorized_keys" | awk '{print $2}')"
+            echo "Installed SSH public-key fingerprint: $key_fingerprint" | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
 
+            # Enable Remote Login and explicitly allow this ephemeral CI user.
             sudo systemsetup -setremotelogin on
+            sudo dseditgroup -o edit -a "$remote_user" -t user com.apple.access_ssh >> "$log" 2>&1 || true
 
-            # The PF rules above provide the network boundary for TCP 22.
+            # Make SSH key-only for this ephemeral runner account. This prevents
+            # password prompts if the client key is not accepted; the workflow
+            # logs the public-key fingerprint so the client and server can be compared.
+            if ! sudo grep -Fq '# BEGIN GitHub Actions runner key-only SSH policy' "$sshd_config"; then
+              {
+                echo
+                echo '# BEGIN GitHub Actions runner key-only SSH policy'
+                echo "Match User $remote_user"
+                echo '  PubkeyAuthentication yes'
+                echo '  AuthorizedKeysFile .ssh/authorized_keys'
+                echo '  AuthenticationMethods publickey'
+                echo '  PasswordAuthentication no'
+                echo '  KbdInteractiveAuthentication no'
+                echo '# END GitHub Actions runner key-only SSH policy'
+              } | sudo tee -a "$sshd_config" >/dev/null
+            fi
+
+            sudo /usr/sbin/sshd -t
+            sudo /usr/sbin/sshd -T -C "user=$remote_user,host=localhost,addr=127.0.0.1" |
+              awk '/^(pubkeyauthentication|authorizedkeysfile|authenticationmethods|passwordauthentication|kbdinteractiveauthentication) / { print "Effective sshd config: " $0 }' |
+              tee -a "$REPORT_DIR/remote-access.txt"
             sudo launchctl kickstart -k system/com.openssh.sshd >/dev/null 2>&1 || true
+
             for _ in $(seq 1 30); do
               if nc -z -G 2 "$TAILSCALE_IP" 22 >/dev/null 2>&1; then
-                echo "SSH listener is ready for key-based login as $remote_user."
+                echo "SSH listener is ready for key-only login as $remote_user."
                 exit 0
               fi
               sleep 1
             done
             echo 'sshd did not listen on TCP 22 within 30 seconds.'
             exit 12
-          ) > "$log" 2>&1 || ssh_error="$(tail -n 12 "$log" | tr '\n' ' ')"
+          ) > "$log" 2>&1 || ssh_error="$(tail -n 20 "$log" | tr '\n' ' ')"
 
           if [[ -z "$ssh_error" ]]; then
             ssh_status='passed'
@@ -290,6 +314,18 @@ jobs:
             echo '- The workflow filters inbound TCP 22/5900 so only Tailscale IPv4 peers can reach them.'
             echo '- VNC authentication uses legacy VNC password mode; keep the 8-character password unique and rely on Tailscale ACLs as the network boundary.'
           } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish SSH diagnostics immediately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-ssh-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/macos-remote-session/ssh-setup.log
+            ${{ runner.temp }}/macos-remote-session/remote-access.txt
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 1
 
       - name: Keep session active with periodic heartbeats
         id: session
