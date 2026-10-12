@@ -230,8 +230,44 @@ We strongly encourage customers to build their own images using the main branch.
 This repository contains multiple branches and releases that serve as document milestones to reflect what software is installed in the images at certain point of time. Current builds are not idempotent and if one tries to build a runner image using the specific tag it is not guaranteed that the build will succeed.
 </details>
 
-## Windows Server 2022 long session
+## Windows Server 2022 SSH + VNC access
 
-The [Windows Server 2022 long-session workflow](.github/workflows/windows-server-2022-long-session.yml) runs on the GitHub-hosted `windows-2022` image. The job timeout is set to the hosted-runner maximum of **360 minutes**; the default keepalive lasts 350 minutes so there is time to write diagnostics and upload the session report. Run it manually from **Actions → Windows Server 2022 — Long Session → Run workflow** to choose the duration and heartbeat interval.
+The [Windows Server 2022 workflow](.github/workflows/windows-server-2022-long-session.yml) provisions Windows OpenSSH Server and TightVNC Server on the GitHub-hosted `windows-2022` runner. It connects the runner to a private Tailscale network; ports 22 (SSH) and 5900 (VNC) are allowed by the Windows firewall only from Tailscale IPv4 addresses. It does not publish SSH or VNC directly to the public internet.
 
-This is an ephemeral CI runner, not a persistent VM or remote desktop. It does not enable inbound RDP or create a remote-access tunnel; the host is discarded when the job ends.
+### One-time setup
+
+1. Install Tailscale on the device you will connect from and sign in to your tailnet.
+2. In the Tailscale admin console, create the `tag:ci` tag and configure the tailnet policy so your member account can reach tagged CI devices on TCP ports 22 and 5900. For a policy using grants, the relevant rule is:
+
+   ```json
+   {
+     "tagOwners": {
+       "tag:ci": ["autogroup:admin"]
+     },
+     "grants": [
+       {
+         "src": ["autogroup:member"],
+         "dst": ["tag:ci"],
+         "ip": ["tcp:22", "tcp:5900"]
+       }
+     ]
+   }
+   ```
+
+   Merge the tag owner and grant into your existing policy; do not replace other policy rules.
+3. Create a Tailscale auth key with the `tag:ci` identity, **Reusable** and **Ephemeral** enabled, and pre-approve it if your tailnet enforces device approval. Store it as repository secret `TAILSCALE_AUTHKEY`.
+4. In GitHub, open **Settings → Secrets and variables → Actions** for this repository and create these repository secrets:
+   - `TAILSCALE_AUTHKEY`: the tagged Tailscale auth key described above.
+   - `REMOTE_PASSWORD`: a strong password of at least 14 characters for the workflow's Windows account.
+   - `VNC_PASSWORD`: exactly 8 ASCII letters or digits. Classic VNC authentication only supports a short password; Tailscale access controls remain the main network boundary.
+
+### Start and connect
+
+Open **Actions → Windows Server 2022 — Long Session → Run workflow**. Select a session length up to 350 minutes. The workflow summary reports the current Tailscale IPv4 address and Windows account after SSH and VNC are listening.
+
+From a device connected to the same Tailscale network, use the reported values:
+
+- SSH: `ssh WINDOWS_USER@TAILSCALE_IP` (password is the `REMOTE_PASSWORD` secret).
+- VNC: connect your VNC viewer to `TAILSCALE_IP:5900` (password is the `VNC_PASSWORD` secret).
+
+The run has a 360-minute hard timeout and cancels any previous session when a new one starts. This remains an ephemeral GitHub-hosted CI machine, not a persistent VM: the Tailscale node and remote access disappear when the job ends.
