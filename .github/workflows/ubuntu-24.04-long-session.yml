@@ -1,0 +1,299 @@
+name: Ubuntu 24.04 — Long Session
+run-name: "Ubuntu 24.04 SSH + VNC • ${{ inputs.session_minutes || 350 }} minutes"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: Session length in minutes (maximum 350; job timeout is 360 minutes)
+        required: true
+        type: number
+        default: 350
+      heartbeat_minutes:
+        description: Write a heartbeat every N minutes
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "5"
+          - "10"
+          - "15"
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-2404-long-session
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-session:
+    name: Ubuntu 24.04 with private SSH and VNC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      SESSION_MINUTES: ${{ inputs.session_minutes || 350 }}
+      HEARTBEAT_MINUTES: ${{ inputs.heartbeat_minutes || 5 }}
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Validate remote-access secrets
+        shell: bash
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${TAILSCALE_AUTHKEY}" ]] || missing+=(TAILSCALE_AUTHKEY)
+          [[ -n "${SSH_PUBLIC_KEY}" ]] || missing+=(SSH_PUBLIC_KEY)
+          [[ -n "${VNC_PASSWORD}" ]] || missing+=(VNC_PASSWORD)
+          if (( ${#missing[@]} )); then
+            printf 'Missing repository Actions secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ ! "${VNC_PASSWORD}" =~ ^[A-Za-z0-9]{8}$ ]]; then
+            echo 'VNC_PASSWORD must be exactly 8 ASCII letters/digits.' >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+) [A-Za-z0-9+/]+={0,3}([[:space:]].*)?$'; then
+            echo 'SSH_PUBLIC_KEY must be one valid-looking OpenSSH public-key line.' >&2
+            exit 1
+          fi
+          echo 'Required remote-access secrets are present; secret values are not printed.'
+
+      - name: Identify the Ubuntu host
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/ubuntu-2404-session"
+          mkdir -p "$report_dir"
+          echo "REPORT_DIR=$report_dir" >> "$GITHUB_ENV"
+          {
+            echo 'Ubuntu 24.04 hosted runner session'
+            echo "UTC start: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo "Hostname: $(hostname)"
+            echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")"
+            echo "Kernel: $(uname -sr)"
+            echo "Architecture: $(uname -m)"
+            echo "CPU: $(lscpu | awk -F: '/Model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}')"
+            echo "Logical CPUs: $(nproc)"
+            echo "Memory: $(awk '/MemTotal/ {printf "%.2f GiB\n", $2/1048576}' /proc/meminfo)"
+            echo
+            df -h /
+            echo
+            echo 'Network access is intended to use the private Tailscale overlay.'
+            echo 'This ephemeral GitHub-hosted runner is discarded after the job ends.'
+          } | tee "$report_dir/runner-report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: "false"
+
+      - name: Install and configure OpenSSH Server (non-blocking)
+        id: ssh
+        continue-on-error: true
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          # SSH failures are recorded but must not prevent VNC setup.
+          set -uo pipefail
+          status=failed
+          error_file="$REPORT_DIR/ssh-diagnostics.txt"
+          {
+            set -e
+            sudo apt-get update
+            sudo apt-get install -y openssh-server
+            install -d -m 700 "$HOME/.ssh"
+            printf '%s\n' "$SSH_PUBLIC_KEY" > "$HOME/.ssh/authorized_keys"
+            chmod 600 "$HOME/.ssh/authorized_keys"
+            ssh-keygen -lf "$HOME/.ssh/authorized_keys" >/dev/null
+
+            sudo install -d -m 755 /etc/ssh/sshd_config.d
+            sudo tee /etc/ssh/sshd_config.d/99-github-session.conf >/dev/null <<'EOF'
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowUsers runner
+          EOF
+            sudo sshd -t
+            sudo systemctl enable ssh
+            sudo systemctl restart ssh
+
+            for _ in $(seq 1 30); do
+              if sudo ss -ltn '( sport = :22 )' | grep -q LISTEN; then
+                status=passed
+                break
+              fi
+              sleep 1
+            done
+            [[ "$status" == passed ]] || { echo 'sshd did not listen on TCP port 22.'; exit 1; }
+            echo "SSH key authentication configured for user $(id -un); password authentication disabled." | tee "$REPORT_DIR/remote-access.txt"
+          } 2> >(tee "$error_file" >&2) || {
+            echo 'SSH setup failed; continuing to VNC setup. See ssh-diagnostics.txt in the artifact.'
+          }
+          {
+            echo "SSH setup status: $status"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$status" != passed ]]; then
+            echo 'SSH setup failed; VNC setup will continue.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install and start XFCE virtual desktop and VNC
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal dbus-x11 xauth xvfb x11vnc xterm \
+            fonts-dejavu-core ca-certificates
+          report_dir="$REPORT_DIR"
+          vnc_dir="$HOME/.vnc"
+          install -d -m 700 "$vnc_dir"
+          password_file="$(mktemp)"
+          trap 'rm -f "$password_file"' EXIT
+          printf '%s\n' "$VNC_PASSWORD" > "$password_file"
+          x11vnc -storepasswd "$VNC_PASSWORD" "$vnc_dir/passwd" >/dev/null
+          chmod 600 "$vnc_dir/passwd"
+          rm -f "$password_file"
+          unset VNC_PASSWORD
+
+          # Use a dedicated virtual display so VNC works without a physical monitor.
+          if pgrep -f '[X]vfb :1' >/dev/null; then
+            echo 'Display :1 is already occupied.' >&2
+            exit 1
+          fi
+          nohup Xvfb :1 -screen 0 1600x900x24 -ac +extension RANDR \
+            >"$report_dir/xvfb.log" 2>&1 &
+          echo $! > "$report_dir/xvfb.pid"
+          for _ in $(seq 1 30); do
+            if DISPLAY=:1 xdpyinfo >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          DISPLAY=:1 xdpyinfo >/dev/null
+
+          nohup dbus-launch --exit-with-session startxfce4 \
+            >"$report_dir/xfce.log" 2>&1 &
+          echo $! > "$report_dir/xfce.pid"
+          nohup x11vnc -display :1 -rfbauth "$vnc_dir/passwd" \
+            -rfbport 5900 -forever -shared -noxdamage -repeat \
+            -o "$report_dir/x11vnc.log" \
+            >"$report_dir/x11vnc-stdout.log" 2>&1 &
+          echo $! > "$report_dir/x11vnc.pid"
+
+          vnc_ready=false
+          for _ in $(seq 1 30); do
+            if ss -ltn '( sport = :5900 )' | grep -q LISTEN; then
+              vnc_ready=true
+              break
+            fi
+            sleep 1
+          done
+          [[ "$vnc_ready" == true ]] || {
+            cat "$report_dir/x11vnc.log" "$report_dir/x11vnc-stdout.log" 2>/dev/null || true
+            echo 'VNC did not listen on TCP port 5900.' >&2
+            exit 1
+          }
+
+          # Restrict SSH and VNC to traffic arriving on Tailscale's interface.
+          # Do not reset the runner's existing firewall configuration.
+          if command -v ufw >/dev/null 2>&1; then
+            sudo ufw default deny incoming
+            sudo ufw default allow outgoing
+            sudo ufw allow in on tailscale0 to any port 22 proto tcp
+            sudo ufw allow in on tailscale0 to any port 5900 proto tcp
+            sudo ufw --force enable
+          else
+            echo 'ufw is unavailable; Tailscale ACLs must restrict SSH/VNC access to trusted tailnet devices.' |
+              tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo
+            echo '## Desktop ready'
+            echo '- Desktop: XFCE on virtual display :1 (1600x900, 24-bit)'
+            echo '- VNC viewer: use the private Tailscale IPv4 address on TCP port 5900'
+            echo '- VNC password: repository Actions secret VNC_PASSWORD'
+            echo '- SSH user: runner; SSH uses the public key in SSH_PUBLIC_KEY'
+            echo '- Connect the client device to the same Tailscale network first.'
+            echo '- Do not expose SSH/VNC to the public Internet; use tailnet access controls.'
+          } | tee -a "$GITHUB_STEP_SUMMARY" "$report_dir/remote-access.txt"
+
+      - name: Publish private connection details
+        shell: bash
+        run: |
+          set -euo pipefail
+          tailnet_ip="$(tailscale ip -4 | awk '/^100\./ {print; exit}')"
+          [[ -n "$tailnet_ip" ]] || { echo 'Tailscale did not report a private IPv4 address.' >&2; exit 1; }
+          {
+            echo
+            echo '## Private SSH + VNC connection'
+            echo "- Tailscale IPv4: $tailnet_ip"
+            echo "- SSH: ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes runner@$tailnet_ip"
+            echo "- VNC: $tailnet_ip:5900 (TigerVNC viewer: $tailnet_ip::5900)"
+            echo '- VNC password: repository Actions secret VNC_PASSWORD'
+            echo '- Connect your client device to the same Tailscale network first.'
+            echo '- Access is intended to be private to your tailnet.'
+          } | tee -a "$GITHUB_STEP_SUMMARY" "$REPORT_DIR/remote-access.txt"
+
+      - name: Keep the session active with periodic heartbeats
+        id: session
+        shell: bash
+        timeout-minutes: 355
+        run: |
+          set -euo pipefail
+          if ! [[ "$SESSION_MINUTES" =~ ^[0-9]+$ ]] || (( SESSION_MINUTES < 1 || SESSION_MINUTES > 350 )); then
+            echo 'session_minutes must be an integer between 1 and 350.' >&2
+            exit 1
+          fi
+          if [[ ! "$HEARTBEAT_MINUTES" =~ ^(1|5|10|15)$ ]]; then
+            echo 'heartbeat_minutes must be 1, 5, 10, or 15.' >&2
+            exit 1
+          fi
+          log="$REPORT_DIR/heartbeat.log"
+          started="$(date -u +%s)"
+          deadline=$((started + SESSION_MINUTES * 60))
+          echo "Started UTC=$(date -u -d "@$started" '+%Y-%m-%d %H:%M:%SZ'); target minutes=$SESSION_MINUTES; heartbeat minutes=$HEARTBEAT_MINUTES" | tee "$log"
+          echo "Session target: $SESSION_MINUTES minutes; job hard timeout is 360 minutes." | tee -a "$GITHUB_STEP_SUMMARY"
+          while true; do
+            now="$(date -u +%s)"
+            remaining=$((deadline - now))
+            (( remaining > 0 )) || break
+            sleep_for=$((HEARTBEAT_MINUTES * 60))
+            (( sleep_for <= remaining )) || sleep_for=$remaining
+            sleep "$sleep_for"
+            now="$(date -u +%s)"
+            remaining_minutes=$(((deadline - now + 59) / 60))
+            (( remaining_minutes >= 0 )) || remaining_minutes=0
+            echo "Heartbeat UTC=$(date -u -d "@$now" '+%Y-%m-%d %H:%M:%SZ'); remaining_minutes=$remaining_minutes" | tee -a "$log"
+          done
+          ended="$(date -u +%s)"
+          printf 'Ended UTC=%s; elapsed_minutes=%s\n' "$(date -u -d "@$ended" '+%Y-%m-%d %H:%M:%SZ')" "$(((ended-started)/60))" | tee -a "$log"
+          {
+            echo
+            echo '## Session completed'
+            echo "- Started: $(date -u -d "@$started" '+%Y-%m-%d %H:%M:%SZ')"
+            echo "- Ended: $(date -u -d "@$ended" '+%Y-%m-%d %H:%M:%SZ')"
+            echo "- Requested duration: $SESSION_MINUTES minutes"
+            echo "- Heartbeat interval: $HEARTBEAT_MINUTES minutes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload session diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-2404-session-${{ github.run_id }}
+          path: ${{ runner.temp }}/ubuntu-2404-session/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 1
