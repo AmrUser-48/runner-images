@@ -1,0 +1,332 @@
+name: macOS — Remote Control Session
+run-name: "macOS remote control • ${{ inputs.session_minutes || 350 }} minutes • ${{ inputs.runner_label || 'macos-15-intel' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: macOS runner type
+        required: true
+        type: choice
+        options:
+          - macos-15-intel
+          - macos-26-intel
+          - macos-latest
+        default: macos-15-intel
+      session_minutes:
+        description: Session duration in minutes (maximum 350; job timeout is 360 minutes)
+        required: true
+        type: number
+        default: 350
+      heartbeat_minutes:
+        description: Write a heartbeat every N minutes
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "5"
+          - "10"
+          - "15"
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-remote-control-session
+  cancel-in-progress: true
+
+jobs:
+  macos-session:
+    name: macOS remote control via private Tailscale
+    runs-on: ${{ inputs.runner_label || 'macos-15-intel' }}
+    timeout-minutes: 360
+
+    env:
+      SESSION_MINUTES: ${{ inputs.session_minutes || 350 }}
+      HEARTBEAT_MINUTES: ${{ inputs.heartbeat_minutes || 5 }}
+
+    steps:
+      - name: Validate Tailscale and VNC secrets
+        shell: bash
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${TAILSCALE_AUTHKEY:-}" ]] || missing+=(TAILSCALE_AUTHKEY)
+          [[ -n "${VNC_PASSWORD:-}" ]] || missing+=(VNC_PASSWORD)
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing GitHub Actions secret(s): %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ ! "$VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]]; then
+            echo 'VNC_PASSWORD must be exactly 8 ASCII letters or digits.' >&2
+            exit 1
+          fi
+          echo 'Required Tailscale and VNC secrets are present.'
+
+      - name: Identify macOS host
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/macos-remote-session"
+          mkdir -p "$report_dir"
+          printf 'REPORT_DIR=%s\n' "$report_dir" >> "$GITHUB_ENV"
+
+          {
+            echo 'macOS remote-control session'
+            echo "UTC start: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo "Computer: $(scutil --get ComputerName 2>/dev/null || hostname)"
+            echo "User: $(id -un)"
+            echo "Architecture: $(uname -m)"
+            sw_vers
+            echo
+            echo 'CPU / memory:'
+            sysctl -n machdep.cpu.brand_string 2>/dev/null || true
+            sysctl -n hw.memsize 2>/dev/null | awk '{printf "Memory GiB: %.1f\n", $1/1024/1024/1024}' || true
+            echo
+            df -h /
+            echo
+            echo 'This is an ephemeral GitHub-hosted runner; it is discarded after the job ends.'
+          } | tee "$report_dir/runner-report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: "false"
+
+      - name: Restrict remote-access ports to Tailscale
+        id: network
+        shell: bash
+        run: |
+          set -euo pipefail
+          ts_bin="$(command -v tailscale || true)"
+          if [[ -z "$ts_bin" ]]; then
+            for candidate in /opt/homebrew/bin/tailscale /usr/local/bin/tailscale /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
+              if [[ -x "$candidate" ]]; then ts_bin="$candidate"; break; fi
+            done
+          fi
+          if [[ -z "$ts_bin" ]]; then
+            echo 'Cannot locate the Tailscale CLI.' >&2
+            exit 1
+          fi
+
+          tailnet_ip="$("$ts_bin" ip -4 | awk '/^100\./ { print; exit }')"
+          if [[ ! "$tailnet_ip" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo 'Tailscale did not provide a valid 100.x IPv4 address.' >&2
+            exit 1
+          fi
+          printf 'TAILSCALE_IP=%s\n' "$tailnet_ip" >> "$GITHUB_ENV"
+          printf 'Tailscale IPv4: %s\n' "$tailnet_ip" | tee -a "$REPORT_DIR/remote-access.txt"
+
+          # Put explicit, quick-match rules before the stock Apple PF anchors.
+          # Only peers using Tailscale IPv4 can reach SSH/VNC; non-tailnet inbound
+          # access to TCP 22 and 5900 is blocked on both IPv4 and IPv6.
+          pf_temp="$RUNNER_TEMP/pf-remote-control.conf"
+          {
+            printf 'pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n' "$tailnet_ip"
+            printf 'block in quick proto tcp from any to any port { 22, 5900 }\n'
+            cat /etc/pf.conf
+          } > "$pf_temp"
+
+          sudo pfctl -nf "$pf_temp"
+          sudo pfctl -f "$pf_temp"
+          if ! sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+            sudo pfctl -E >/dev/null
+          fi
+          sudo pfctl -s info | grep 'Status:' | tee -a "$REPORT_DIR/remote-access.txt"
+          {
+            echo
+            echo 'PF policy: inbound TCP 22/5900 permitted only from Tailscale IPv4 peers to the runner Tailscale address.'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Enable macOS Screen Sharing and VNC
+        id: vnc
+        continue-on-error: true
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -u
+          kickstart='/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart'
+          log="$REPORT_DIR/screen-sharing-setup.log"
+          remote_user="$(id -un)"
+          setup_rc=0
+
+          if [[ ! -x "$kickstart" ]]; then
+            echo "Apple Remote Desktop kickstart tool not found: $kickstart" | tee "$log"
+            echo 'VNC setup failed: kickstart tool not found.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Use a VNC-specific password. Do not print it to workflow logs.
+          sudo "$kickstart"             -activate             -configure -users "$remote_user" -access -on -privs -all             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD"             -restart -agent > "$log" 2>&1 || setup_rc=$?
+
+          # Try the Screen Sharing launch service as well; recent macOS versions
+          # may require GUI/MDM authorization that a hosted CI session cannot grant.
+          sudo launchctl enable system/com.apple.screensharing >> "$log" 2>&1 || true
+          sudo launchctl kickstart -k system/com.apple.screensharing >> "$log" 2>&1 || true
+
+          vnc_ready=false
+          for _ in $(seq 1 30); do
+            if nc -z -G 2 "$TAILSCALE_IP" 5900 >/dev/null 2>&1; then
+              vnc_ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          {
+            echo "Screen Sharing setup command exit: $setup_rc"
+            echo "VNC TCP 5900 listener reachable on Tailscale address: $vnc_ready"
+            sudo lsof -nP -iTCP:5900 -sTCP:LISTEN 2>/dev/null || true
+          } | tee -a "$log" | tee -a "$REPORT_DIR/remote-access.txt"
+
+          if [[ "$vnc_ready" == true ]]; then
+            echo 'VNC status: TCP 5900 is listening on the Tailscale address.' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo 'VNC status: NOT READY. Screen Sharing may require GUI/MDM authorization on this macOS image.'
+              echo 'See the screen-sharing-setup.log artifact. Optional SSH will still be attempted.'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Enable SSH (optional; non-blocking)
+        id: ssh
+        continue-on-error: true
+        shell: bash
+        env:
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
+        run: |
+          set -u
+          log="$REPORT_DIR/ssh-setup.log"
+          ssh_status='failed'
+          ssh_error=''
+
+          (
+            set -euo pipefail
+            if [[ -z "${REMOTE_PASSWORD:-}" ]]; then
+              echo 'REMOTE_PASSWORD is not set; SSH skipped.'
+              exit 10
+            fi
+            if [[ ${#REMOTE_PASSWORD} -lt 16 ||
+                  ! "$REMOTE_PASSWORD" =~ [A-Z] ||
+                  ! "$REMOTE_PASSWORD" =~ [a-z] ||
+                  ! "$REMOTE_PASSWORD" =~ [0-9] ||
+                  ! "$REMOTE_PASSWORD" =~ [^A-Za-z0-9] ]]; then
+              echo 'REMOTE_PASSWORD must be at least 16 characters and contain uppercase, lowercase, numeric, and special characters.'
+              exit 11
+            fi
+
+            remote_user="$(id -un)"
+            sudo dscl . -passwd "/Users/$remote_user" "$REMOTE_PASSWORD"
+            sudo systemsetup -setremotelogin on
+
+            # The PF rules above provide the network boundary for TCP 22.
+            sudo launchctl kickstart -k system/com.openssh.sshd >/dev/null 2>&1 || true
+            for _ in $(seq 1 30); do
+              if nc -z -G 2 "$TAILSCALE_IP" 22 >/dev/null 2>&1; then
+                echo "SSH listener is ready for user $remote_user."
+                exit 0
+              fi
+              sleep 1
+            done
+            echo 'sshd did not listen on TCP 22 within 30 seconds.'
+            exit 12
+          ) > "$log" 2>&1 || ssh_error="$(tail -n 12 "$log" | tr '\n' ' ')"
+
+          if [[ -z "$ssh_error" ]]; then
+            ssh_status='passed'
+          fi
+          {
+            echo "SSH status: $ssh_status"
+            if [[ -n "$ssh_error" ]]; then echo "SSH detail: $ssh_error"; fi
+          } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Do not fail this step: Screen Sharing must remain available if SSH fails.
+
+      - name: Publish private connection details
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_user="$(id -un)"
+          vnc_status='unavailable'
+          ssh_status='unavailable'
+          nc -z -G 2 "$TAILSCALE_IP" 5900 >/dev/null 2>&1 && vnc_status='listening on TCP 5900'
+          nc -z -G 2 "$TAILSCALE_IP" 22 >/dev/null 2>&1 && ssh_status='listening on TCP 22'
+
+          {
+            echo
+            echo '## Private macOS remote access'
+            echo
+            echo "- Runner label: ${{ inputs.runner_label || 'macos-15-intel' }}"
+            echo "- macOS user: $remote_user"
+            echo "- Tailscale IPv4: $TAILSCALE_IP"
+            echo "- Screen Sharing/VNC status: $vnc_status"
+            echo "- SSH status: $ssh_status"
+            echo "- VNC host: $TAILSCALE_IP, TCP port 5900 (password: GitHub Actions secret VNC_PASSWORD)"
+            echo "- macOS Screen Sharing URI: vnc://$TAILSCALE_IP"
+            echo "- SSH: ssh $remote_user@$TAILSCALE_IP (password: optional secret REMOTE_PASSWORD)"
+            echo '- Connect your client device to the same Tailscale network first.'
+            echo '- The workflow filters inbound TCP 22/5900 so only Tailscale IPv4 peers can reach them.'
+            echo '- VNC authentication uses legacy VNC password mode; keep the 8-character password unique and rely on Tailscale ACLs as the network boundary.'
+          } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep session active with periodic heartbeats
+        id: session
+        shell: bash
+        timeout-minutes: 355
+        run: |
+          set -euo pipefail
+          session_minutes="${SESSION_MINUTES:-350}"
+          heartbeat_minutes="${HEARTBEAT_MINUTES:-5}"
+          [[ "$session_minutes" =~ ^[0-9]+$ ]] || { echo 'session_minutes must be an integer.' >&2; exit 1; }
+          [[ "$heartbeat_minutes" =~ ^(1|5|10|15)$ ]] || { echo 'heartbeat_minutes must be 1, 5, 10, or 15.' >&2; exit 1; }
+          (( session_minutes >= 1 && session_minutes <= 350 )) || { echo 'session_minutes must be between 1 and 350.' >&2; exit 1; }
+
+          log="$REPORT_DIR/heartbeat.log"
+          started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          start_epoch="$(date +%s)"
+          deadline=$(( start_epoch + session_minutes * 60 ))
+          echo "Started UTC=$started; target minutes=$session_minutes; heartbeat minutes=$heartbeat_minutes" | tee "$log"
+          echo "Session target: $session_minutes minutes; job hard timeout: 360 minutes." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          while true; do
+            now_epoch="$(date +%s)"
+            remaining=$(( deadline - now_epoch ))
+            (( remaining > 0 )) || break
+            sleep_seconds=$(( heartbeat_minutes * 60 ))
+            (( sleep_seconds <= remaining )) || sleep_seconds=$remaining
+            sleep "$sleep_seconds"
+            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            now_epoch="$(date +%s)"
+            remaining_minutes=$(( (deadline - now_epoch + 59) / 60 ))
+            (( remaining_minutes >= 0 )) || remaining_minutes=0
+            line="Heartbeat UTC=$now; remaining_minutes=$remaining_minutes"
+            echo "$line" | tee -a "$log"
+          done
+
+          ended="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          elapsed_seconds=$(( $(date +%s) - start_epoch ))
+          printf 'Ended UTC=%s; elapsed_minutes=%s\n' "$ended" "$(( elapsed_seconds / 60 ))" | tee -a "$log"
+          {
+            echo
+            echo '## macOS session completed'
+            echo "- Started UTC: $started"
+            echo "- Ended UTC: $ended"
+            echo "- Requested duration: $session_minutes minutes"
+            echo "- Heartbeat interval: $heartbeat_minutes minutes"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS session diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-remote-session-${{ github.run_id }}
+          path: ${{ runner.temp }}/macos-remote-session/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 1
