@@ -283,7 +283,7 @@ This workflow reuses the Tailscale setup described in [Windows Server 2022 SSH +
 
 - `TAILSCALE_AUTHKEY`: a reusable, ephemeral Tailscale auth key tagged `tag:ci`, pre-approved if device approval is enabled.
 - `VNC_PASSWORD`: exactly 8 ASCII letters or digits, as required by legacy VNC authentication.
-- `REMOTE_PASSWORD` (optional): at least 16 characters, with uppercase, lowercase, numeric, and special characters. If missing or invalid, SSH setup is skipped and does not prevent the VNC attempt.
+- `SSH_PUBLIC_KEY` (optional): your SSH **public** key, copied from a client key file such as `~/.ssh/id_ed25519_macos_runner.pub`. SSH setup installs it in the ephemeral runner user's `~/.ssh/authorized_keys`; the private key must remain on your client. If this secret is missing or invalid, SSH setup is skipped and does not prevent the VNC attempt.
 
 Ensure your tailnet policy permits your client device to reach `tag:ci` on TCP ports 22 and 5900. Merge the corresponding grant from the Windows section into your existing policy rather than replacing existing rules.
 
@@ -295,7 +295,7 @@ From a device connected to the same Tailscale network:
 
 - VNC: connect to the reported Tailscale IPv4 address on TCP port `5900`; with TigerVNC on Linux, run `vncviewer TAILSCALE_IP::5900`. Use the `VNC_PASSWORD` secret.
 - On macOS, open `vnc://TAILSCALE_IP` in Screen Sharing.
-- SSH (if configured): `ssh MACOS_USER@TAILSCALE_IP`; use the optional `REMOTE_PASSWORD` secret.
+- SSH (if configured): `ssh -i ~/.ssh/id_ed25519_macos_runner -o IdentitiesOnly=yes MACOS_USER@TAILSCALE_IP`; authenticate with the private key that matches `SSH_PUBLIC_KEY`.
 
 ### macOS Screen Sharing limitation
 
