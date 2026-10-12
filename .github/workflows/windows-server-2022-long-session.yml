@@ -53,11 +53,32 @@ jobs:
           if ($missing.Count -gt 0) {
             throw "Configure these repository Actions secrets first: $($missing -join ', '). See README section 'Windows Server 2022 SSH + VNC access'. Secret values are never printed."
           }
-          if ($env:REMOTE_PASSWORD.Length -lt 14) { throw 'REMOTE_PASSWORD must be at least 14 characters long.' }
+          if ($env:REMOTE_PASSWORD.Length -lt 16) {
+            throw 'REMOTE_PASSWORD must be at least 16 characters long.'
+          }
+          if ($env:REMOTE_PASSWORD -notmatch '[A-Z]' -or
+              $env:REMOTE_PASSWORD -notmatch '[a-z]' -or
+              $env:REMOTE_PASSWORD -notmatch '[0-9]' -or
+              $env:REMOTE_PASSWORD -notmatch '[^A-Za-z0-9]') {
+            throw 'REMOTE_PASSWORD must contain uppercase, lowercase, numeric, and special characters.'
+          }
+          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
+          if ($remoteUser.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($remoteUser, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw 'REMOTE_PASSWORD must not contain the Windows account name.'
+          }
+          $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
+          if (-not [string]::IsNullOrWhiteSpace($localUser.FullName)) {
+            $nameParts = $localUser.FullName -split '[\\s,\.\-_#\t]+'
+            foreach ($part in $nameParts) {
+              if ($part.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($part, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw 'REMOTE_PASSWORD must not contain any part of the Windows account full name.'
+              }
+            }
+          }
           if ($env:VNC_PASSWORD -notmatch '^[A-Za-z0-9]{8}$') {
             throw 'VNC_PASSWORD must be exactly 8 ASCII letters/digits.'
           }
-          Write-Host 'Required secrets are present; password formats are valid.'
+          Write-Host 'Required secrets are present and satisfy the workflow password-strength checks.'
 
       - name: Identify the Windows host
         id: host
