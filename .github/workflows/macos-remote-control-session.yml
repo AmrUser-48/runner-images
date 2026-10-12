@@ -156,6 +156,83 @@ jobs:
             echo 'PF policy: inbound TCP 22/5900 permitted only from Tailscale IPv4 peers to the runner Tailscale address.'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Grant Screen Sharing TCC permissions on CI runner
+        id: screensharing-tcc
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          log="$REPORT_DIR/tcc-screen-sharing.log"
+          exec > >(tee -a "$log") 2>&1
+
+          echo "macOS version: $(sw_vers -productVersion)"
+          sip_status="$(csrutil status 2>&1 || true)"
+          echo "SIP status: $sip_status"
+
+          # GitHub-hosted macOS CI images have commonly shipped with SIP disabled.
+          # When available, seed the Screen Sharing agent's TCC grants directly,
+          # a workaround used by macOS VM/CI projects for headless guests.
+          # If the database remains protected, don't fail the entire session.
+          if ! printf '%s\n' "$sip_status" | grep -Eqi 'disabled|unknown'; then
+            echo 'SIP is enabled; skipping direct TCC database grant.'
+            echo 'TCC workaround: skipped (SIP is enabled).' >> "$REPORT_DIR/remote-access.txt"
+            exit 0
+          fi
+
+          db='/Library/Application Support/com.apple.TCC/TCC.db'
+          if [[ ! -f "$db" ]]; then
+            echo "System TCC database not found: $db"
+            echo 'TCC workaround: system database missing.' >> "$REPORT_DIR/remote-access.txt"
+            exit 0
+          fi
+          if ! sudo -n true 2>/dev/null; then
+            echo 'Passwordless sudo is unavailable; cannot update the system TCC database.'
+            echo 'TCC workaround: failed (sudo unavailable).' >> "$REPORT_DIR/remote-access.txt"
+            exit 0
+          fi
+
+          echo 'TCC access table schema:'
+          sudo sqlite3 "$db" 'PRAGMA table_info(access);' || exit 0
+
+          epoch="$(date +%s)"
+          if ! sudo sqlite3 -batch "$db" <<SQL
+          .timeout 5000
+          BEGIN IMMEDIATE;
+          DELETE FROM access
+            WHERE client = 'com.apple.screensharing.agent'
+              AND service IN ('kTCCServiceScreenCapture','kTCCServicePostEvent','kTCCServiceAccessibility');
+          INSERT INTO access
+            (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,flags,last_modified,last_reminded)
+            VALUES('kTCCServiceScreenCapture','com.apple.screensharing.agent',0,2,4,1,0,0,$epoch,$epoch);
+          INSERT INTO access
+            (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,flags,last_modified,last_reminded)
+            VALUES('kTCCServicePostEvent','com.apple.screensharing.agent',0,2,4,1,0,0,$epoch,$epoch);
+          INSERT INTO access
+            (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,flags,last_modified,last_reminded)
+            VALUES('kTCCServiceAccessibility','com.apple.screensharing.agent',0,2,4,1,0,0,$epoch,$epoch);
+          COMMIT;
+          SQL
+          then
+            echo 'Direct TCC update failed. This macOS version may use a different schema or protect the database.'
+            echo 'TCC workaround: failed; inspect tcc-screen-sharing.log.' >> "$REPORT_DIR/remote-access.txt"
+            exit 0
+          fi
+
+          echo 'Resulting Screen Sharing TCC rows:'
+          sudo sqlite3 -separator ' | ' "$db" "SELECT service,client,client_type,auth_value,auth_reason,auth_version FROM access WHERE client='com.apple.screensharing.agent' AND service IN ('kTCCServiceScreenCapture','kTCCServicePostEvent','kTCCServiceAccessibility') ORDER BY service;" || true
+
+          # Refresh TCC and Screen Sharing so they re-read the database entries.
+          sudo killall tccd >/dev/null 2>&1 || true
+          sleep 2
+          plist='/System/Library/LaunchDaemons/com.apple.screensharing.plist'
+          sudo launchctl enable system/com.apple.screensharing >/dev/null 2>&1 || true
+          sudo launchctl bootstrap system "$plist" >/dev/null 2>&1 || true
+          sudo launchctl kickstart -k system/com.apple.screensharing >/dev/null 2>&1 || true
+
+          {
+            echo 'TCC workaround: direct grant attempted for ScreenCapture, PostEvent, and Accessibility; see tcc-screen-sharing.log.'
+          } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Enable macOS Screen Sharing and VNC
         id: vnc
         continue-on-error: true
@@ -339,6 +416,7 @@ jobs:
           name: macos-ssh-diagnostics-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/macos-remote-session/ssh-setup.log
+            ${{ runner.temp }}/macos-remote-session/tcc-screen-sharing.log
             ${{ runner.temp }}/macos-remote-session/remote-access.txt
           if-no-files-found: warn
           retention-days: 1
