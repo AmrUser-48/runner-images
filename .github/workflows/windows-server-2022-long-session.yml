@@ -129,7 +129,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         env:
-          REMOTE_PASSWORD: \${{ secrets.REMOTE_PASSWORD }}
+          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
         run: |
           # SSH is optional: failures are recorded, but must never prevent VNC setup.
           $ErrorActionPreference = 'Stop'
