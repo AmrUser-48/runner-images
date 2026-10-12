@@ -226,7 +226,6 @@ jobs:
               '    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
               '    PubkeyAuthentication yes'
               '    PasswordAuthentication no'
-              '    KbdInteractiveAuthentication no'
               ''
             ) -join [Environment]::NewLine
             Set-Content -LiteralPath $configPath -Value ($prefix.TrimEnd() + [Environment]::NewLine + $userMatch + $suffix) -Encoding ascii
