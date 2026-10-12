@@ -1,0 +1,147 @@
+name: Windows Server 2022 — Long Session
+run-name: "Windows Server 2022 • ${{ inputs.session_minutes || 350 }} minute session"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: Session length in minutes (maximum 350; job timeout is 360 minutes)
+        required: true
+        type: number
+        default: 350
+      heartbeat_minutes:
+        description: Write a heartbeat every N minutes
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "5"
+          - "10"
+          - "15"
+        default: "5"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/windows-server-2022-long-session.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-server-2022-long-session
+  cancel-in-progress: false
+
+jobs:
+  windows-session:
+    name: Start Windows Server 2022 (maximum hosted-runner duration)
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      SESSION_MINUTES: ${{ inputs.session_minutes || 350 }}
+      HEARTBEAT_MINUTES: ${{ inputs.heartbeat_minutes || 5 }}
+
+    steps:
+      - name: Identify the Windows host
+        id: host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reportDir = Join-Path $env:RUNNER_TEMP 'windows-2022-session'
+          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+          "REPORT_DIR=$reportDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $computer = Get-CimInstance Win32_ComputerSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $memoryGiB = [Math]::Round($computer.TotalPhysicalMemory / 1GB, 2)
+          $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+            Select-Object DeviceID,
+              @{Name='SizeGiB';Expression={[Math]::Round($_.Size / 1GB, 1)}},
+              @{Name='FreeGiB';Expression={[Math]::Round($_.FreeSpace / 1GB, 1)}}
+
+          $report = @(
+            'Windows Server 2022 hosted runner session'
+            "UTC start: $([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ssZ'))"
+            "Computer: $env:COMPUTERNAME"
+            "OS: $($os.Caption)"
+            "Version/build: $($os.Version) / $($os.BuildNumber)"
+            "Boot time: $($os.LastBootUpTime)"
+            "Architecture: $env:PROCESSOR_ARCHITECTURE"
+            "CPU: $($cpu.Name)"
+            "Logical processors: $($computer.NumberOfLogicalProcessors)"
+            "Memory GiB: $memoryGiB"
+            ''
+            'Local disks:'
+            ($disks | Format-Table -AutoSize | Out-String -Width 160)
+            'Notes: This is an ephemeral GitHub-hosted CI virtual machine.'
+            'It is not a persistent VM and no inbound RDP or remote-access tunnel is configured.'
+          )
+          $report | Tee-Object -FilePath (Join-Path $reportDir 'runner-report.txt')
+          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep the session active with periodic heartbeats
+        id: session
+        shell: pwsh
+        timeout-minutes: 355
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sessionMinutes = 0
+          $heartbeatMinutes = 0
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$sessionMinutes)) {
+            throw 'session_minutes must be an integer.'
+          }
+          if (-not [int]::TryParse($env:HEARTBEAT_MINUTES, [ref]$heartbeatMinutes)) {
+            throw 'heartbeat_minutes must be an integer.'
+          }
+          if ($sessionMinutes -lt 1 -or $sessionMinutes -gt 350) {
+            throw 'session_minutes must be between 1 and 350 to leave time for final reporting before the 360-minute job timeout.'
+          }
+          if ($heartbeatMinutes -notin @(1, 5, 10, 15)) {
+            throw 'heartbeat_minutes must be one of 1, 5, 10, or 15.'
+          }
+
+          $log = Join-Path $env:REPORT_DIR 'heartbeat.log'
+          $started = [DateTime]::UtcNow
+          $deadline = $started.AddMinutes($sessionMinutes)
+          "Started UTC=$($started.ToString('o')); target minutes=$sessionMinutes; heartbeat minutes=$heartbeatMinutes" |
+            Tee-Object -FilePath $log
+          "Session target: $sessionMinutes minutes. The job hard timeout is 360 minutes." |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          while ($true) {
+            $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+            if ($remaining -le 0) { break }
+
+            $sleepSeconds = [int][Math]::Min($heartbeatMinutes * 60, $remaining)
+            Start-Sleep -Seconds $sleepSeconds
+
+            $now = [DateTime]::UtcNow
+            $remainingMinutes = [Math]::Max(0, [Math]::Ceiling(($deadline - $now).TotalMinutes))
+            $line = "Heartbeat UTC=$($now.ToString('o')); remaining_minutes=$remainingMinutes"
+            Add-Content -Path $log -Value $line -Encoding utf8
+            Write-Host $line
+          }
+
+          $ended = [DateTime]::UtcNow
+          "Ended UTC=$($ended.ToString('o')); elapsed_minutes=$([Math]::Round(($ended - $started).TotalMinutes, 2))" |
+            Tee-Object -FilePath $log -Append
+          @(
+            ''
+            '## Session completed'
+            "- Started: $($started.ToString('yyyy-MM-dd HH:mm:ssZ'))"
+            "- Ended: $($ended.ToString('yyyy-MM-dd HH:mm:ssZ'))"
+            "- Requested duration: $sessionMinutes minutes"
+            "- Heartbeat interval: $heartbeatMinutes minutes"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload session diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-2022-session-${{ github.run_id }}
+          path: ${{ runner.temp }}/windows-2022-session/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 1
