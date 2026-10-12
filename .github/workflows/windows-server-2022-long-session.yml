@@ -124,65 +124,127 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           use-cache: "false"
 
-      - name: Enable Windows OpenSSH Server
+      - name: Enable Windows OpenSSH Server (non-blocking)
+        id: ssh
+        continue-on-error: true
         shell: pwsh
         env:
-          REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
+          REMOTE_PASSWORD: \${{ secrets.REMOTE_PASSWORD }}
         run: |
+          # SSH is optional: failures are recorded, but must never prevent VNC setup.
           $ErrorActionPreference = 'Stop'
-          $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
-          $capability = Get-WindowsCapability -Online -Name $capabilityName
-          if ($capability.State -ne 'Installed') {
-            Add-WindowsCapability -Online -Name $capabilityName | Out-Null
-          }
-
-          $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
-          $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
-          $securePassword = ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force
-          Set-LocalUser -Name $remoteUser -Password $securePassword
-          if (-not $localUser.Enabled) { Enable-LocalUser -Name $remoteUser }
-
-          $configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
-          if (-not (Test-Path $configPath)) { throw "OpenSSH config was not created: $configPath" }
-          $config = Get-Content -LiteralPath $configPath -Raw
-          $match = [regex]::Match($config, '(?im)^[ \t]*Match[ \t]+')
-          if ($match.Success) {
-            $prefix = $config.Substring(0, $match.Index)
-            $suffix = $config.Substring($match.Index)
-          } else {
-            $prefix = $config
-            $suffix = ''
-          }
-          $passwordAuthPattern = '(?im)^[ \t]*#?[ \t]*PasswordAuthentication[ \t]+\S+.*$'
-          if ([regex]::IsMatch($prefix, $passwordAuthPattern)) {
-            $prefix = [regex]::Replace($prefix, $passwordAuthPattern, 'PasswordAuthentication yes')
-          } else {
-            $prefix = $prefix.TrimEnd() + [Environment]::NewLine + 'PasswordAuthentication yes' + [Environment]::NewLine
-          }
-          Set-Content -LiteralPath $configPath -Value ($prefix + $suffix) -Encoding ascii
-
-          # Disable the broad default SSH rule; allow only traffic from Tailscale IPv4.
-          Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue | Disable-NetFirewallRule -ErrorAction SilentlyContinue
-          Get-NetFirewallRule -DisplayName 'SSH via Tailscale only' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-          New-NetFirewallRule -DisplayName 'SSH via Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
-
-          Set-Service -Name sshd -StartupType Automatic
-          if ((Get-Service -Name sshd).Status -eq 'Running') {
-            Restart-Service -Name sshd -Force
-          } else {
-            Start-Service -Name sshd
-          }
-          $sshReady = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            if (Get-NetTCPConnection -State Listen -LocalPort 22 -ErrorAction SilentlyContinue) {
-              $sshReady = $true
-              break
+          $sshStatus = 'failed'
+          $sshError = $null
+          try {
+            $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
+            $capability = Get-WindowsCapability -Online -Name $capabilityName
+            if ($capability.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name $capabilityName | Out-Null
+              $capability = Get-WindowsCapability -Online -Name $capabilityName
             }
-            Start-Sleep -Seconds 1
+            if ($capability.State -ne 'Installed') {
+              throw "OpenSSH Server capability is not installed (state: $($capability.State))."
+            }
+
+            $openSshDir = Join-Path $env:SystemRoot 'System32\OpenSSH'
+            $sshdExe = Join-Path $openSshDir 'sshd.exe'
+            if (-not (Test-Path -LiteralPath $sshdExe)) {
+              throw "OpenSSH Server executable not found: $sshdExe"
+            }
+
+            $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
+            $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
+            $securePassword = ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force
+            Set-LocalUser -Name $remoteUser -Password $securePassword
+            if (-not $localUser.Enabled) { Enable-LocalUser -Name $remoteUser }
+
+            $sshDir = Join-Path $env:ProgramData 'ssh'
+            $configPath = Join-Path $sshDir 'sshd_config'
+            New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+
+            # Some images ship only sshd_config_default. Prefer it; otherwise create a minimal config.
+            if (-not (Test-Path -LiteralPath $configPath)) {
+              $defaultConfig = Join-Path $openSshDir 'sshd_config_default'
+              if (Test-Path -LiteralPath $defaultConfig) {
+                Copy-Item -LiteralPath $defaultConfig -Destination $configPath -Force
+              } else {
+                @(
+                  'Port 22'
+                  'AddressFamily any'
+                  'ListenAddress 0.0.0.0'
+                  'PubkeyAuthentication yes'
+                  'PasswordAuthentication yes'
+                  'Subsystem sftp sftp-server.exe'
+                ) | Set-Content -LiteralPath $configPath -Encoding ascii
+              }
+            }
+            if (-not (Test-Path -LiteralPath $configPath)) {
+              throw "Unable to create OpenSSH configuration: $configPath"
+            }
+
+            $config = Get-Content -LiteralPath $configPath -Raw
+            $match = [regex]::Match($config, '(?im)^[ \t]*Match[ \t]+')
+            if ($match.Success) {
+              $prefix = $config.Substring(0, $match.Index)
+              $suffix = $config.Substring($match.Index)
+            } else {
+              $prefix = $config
+              $suffix = ''
+            }
+            $passwordAuthPattern = '(?im)^[ \t]*#?[ \t]*PasswordAuthentication[ \t]+\S+.*$'
+            if ([regex]::IsMatch($prefix, $passwordAuthPattern)) {
+              $prefix = [regex]::Replace($prefix, $passwordAuthPattern, 'PasswordAuthentication yes')
+            } else {
+              $prefix = $prefix.TrimEnd() + [Environment]::NewLine + 'PasswordAuthentication yes' + [Environment]::NewLine
+            }
+            Set-Content -LiteralPath $configPath -Value ($prefix + $suffix) -Encoding ascii
+
+            # Keep SSH private to the Tailscale address range.
+            Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue |
+              Disable-NetFirewallRule -ErrorAction SilentlyContinue
+            Get-NetFirewallRule -DisplayName 'SSH via Tailscale only' -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName 'SSH via Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+
+            Set-Service -Name sshd -StartupType Automatic
+            if ((Get-Service -Name sshd).Status -eq 'Running') {
+              Restart-Service -Name sshd -Force
+            } else {
+              Start-Service -Name sshd
+            }
+
+            $sshReady = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              if (Get-NetTCPConnection -State Listen -LocalPort 22 -ErrorAction SilentlyContinue) {
+                $sshReady = $true
+                break
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $sshReady) {
+              Get-Service -Name sshd -ErrorAction SilentlyContinue |
+                Format-List * | Out-String |
+                Add-Content -LiteralPath (Join-Path $env:REPORT_DIR 'ssh-diagnostics.txt')
+              throw 'OpenSSH service did not listen on TCP port 22 within 30 seconds.'
+            }
+
+            $sshStatus = 'passed'
+            "SSH configured for $remoteUser on TCP 22; firewall limited to Tailscale IPv4." |
+              Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'remote-access.txt')
+          } catch {
+            $sshError = $_.Exception.Message
+            Write-Warning "SSH setup failed; continuing to TightVNC installation. Reason: $sshError"
+            "SSH setup FAILED: $sshError" |
+              Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'ssh-diagnostics.txt')
+          } finally {
+            "SSH setup status: $sshStatus" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            if ($sshError) {
+              "SSH error: $sshError" |
+                Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            }
           }
-          if (-not $sshReady) { throw 'OpenSSH did not start listening on TCP port 22.' }
-          "SSH configured for $remoteUser on TCP 22; firewall limited to Tailscale IPv4." |
-            Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'remote-access.txt')
+          # Intentionally do not throw: VNC must be attempted even when SSH fails.
 
       - name: Install and configure TightVNC Server
         shell: pwsh
