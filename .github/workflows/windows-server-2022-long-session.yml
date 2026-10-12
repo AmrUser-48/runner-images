@@ -146,8 +146,11 @@ jobs:
           New-NetFirewallRule -DisplayName 'SSH via Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
 
           Set-Service -Name sshd -StartupType Automatic
-          Start-Service -Name sshd
-          Restart-Service -Name sshd
+          if ((Get-Service -Name sshd).Status -eq 'Running') {
+            Restart-Service -Name sshd -Force
+          } else {
+            Start-Service -Name sshd
+          }
           $sshReady = $false
           for ($i = 0; $i -lt 30; $i++) {
             if (Get-NetTCPConnection -State Listen -LocalPort 22 -ErrorAction SilentlyContinue) {
@@ -204,7 +207,11 @@ jobs:
           New-NetFirewallRule -DisplayName 'VNC via Tailscale only' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5900 -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
 
           Set-Service -Name $service.Name -StartupType Automatic
-          Start-Service -Name $service.Name
+          if ((Get-Service -Name $service.Name).Status -eq 'Running') {
+            Restart-Service -Name $service.Name -Force
+          } else {
+            Start-Service -Name $service.Name
+          }
           $vncReady = $false
           for ($i = 0; $i -lt 30; $i++) {
             if (Get-NetTCPConnection -State Listen -LocalPort 5900 -ErrorAction SilentlyContinue) {
