@@ -122,15 +122,24 @@ jobs:
           printf 'TAILSCALE_IP=%s\n' "$tailnet_ip" >> "$GITHUB_ENV"
           printf 'Tailscale IPv4: %s\n' "$tailnet_ip" | tee -a "$REPORT_DIR/remote-access.txt"
 
-          # Put explicit, quick-match rules before the stock Apple PF anchors.
-          # Only peers using Tailscale IPv4 can reach SSH/VNC; non-tailnet inbound
-          # access to TCP 22 and 5900 is blocked on both IPv4 and IPv6.
+          # Insert quick-match rules at the start of PF filter rules, after
+          # the base config directives and before Apple dynamic filter anchors.
           pf_temp="$RUNNER_TEMP/pf-remote-control.conf"
-          {
-            printf 'pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n' "$tailnet_ip"
-            printf 'block in quick proto tcp from any to any port { 22, 5900 }\n'
-            cat /etc/pf.conf
-          } > "$pf_temp"
+          awk -v ip="$tailnet_ip" '
+            BEGIN { inserted=0 }
+            !inserted && index($0, "com.apple/*") > 0 && index($0, "anchor") > 0 {
+              printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\\n", ip
+              print "block in quick proto tcp from any to any port { 22, 5900 }"
+              inserted=1
+            }
+            { print }
+            END {
+              if (!inserted) {
+                printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\\n", ip
+                print "block in quick proto tcp from any to any port { 22, 5900 }"
+              }
+            }
+          ' /etc/pf.conf > "$pf_temp"
 
           sudo pfctl -nf "$pf_temp"
           sudo pfctl -f "$pf_temp"
