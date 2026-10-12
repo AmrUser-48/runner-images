@@ -359,11 +359,12 @@ jobs:
             '## Private SSH + VNC access'
             ''
             '- Tailscale IPv4: ' + $tailnetIp
-            '- SSH: ssh ' + $remoteUser + '@' + $tailnetIp + ' (TCP 22)'
+            '- SSH: ssh -i ~/.ssh/id_ed25519_macos_runner -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no ' + $remoteUser + '@' + $tailnetIp
+            '- SSH authentication: public key from the SSH_PUBLIC_KEY repository secret; SSH password authentication is disabled.'
             '- VNC viewer host: ' + $tailnetIp + '; TCP port 5900 (TigerVNC CLI: ' + $tailnetIp + '::5900)'
             '- Windows username: ' + $remoteUser
-            '- SSH password: GitHub Actions secret REMOTE_PASSWORD'
-            '- VNC password: GitHub Actions secret VNC_PASSWORD'
+            '- Windows desktop/account password: optional GitHub Actions secret REMOTE_PASSWORD'
+            '- VNC password: GitHub Actions secret VNC_PASSWORD (cache locally with TigerVNC -passwd to avoid repeated prompts)'
             '- Connect your client device to the same Tailscale network first.'
             '- Access is restricted to Tailscale IPv4; no public SSH/VNC tunnel is opened.'
           )
