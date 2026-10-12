@@ -268,6 +268,6 @@ Open **Actions → Windows Server 2022 — Long Session → Run workflow**. Sele
 From a device connected to the same Tailscale network, use the reported values:
 
 - SSH: `ssh WINDOWS_USER@TAILSCALE_IP` (password is the `REMOTE_PASSWORD` secret).
-- VNC: connect your VNC viewer to `TAILSCALE_IP:5900` (password is the `VNC_PASSWORD` secret).
+- VNC: set the viewer host to `TAILSCALE_IP` and port to `5900`; on Linux with TigerVNC use `vncviewer TAILSCALE_IP::5900` (password is the `VNC_PASSWORD` secret).
 
 The run has a 360-minute hard timeout and cancels any previous session when a new one starts. This remains an ephemeral GitHub-hosted CI machine, not a persistent VM: the Tailscale node and remote access disappear when the job ends.
