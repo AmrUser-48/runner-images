@@ -178,10 +178,21 @@ jobs:
           # Use a VNC-specific password. Do not print it to workflow logs.
           sudo "$kickstart"             -activate             -configure -users "$remote_user" -access -on -privs -all             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD"             -restart -agent > "$log" 2>&1 || setup_rc=$?
 
-          # Try the Screen Sharing launch service as well; recent macOS versions
-          # may require GUI/MDM authorization that a hosted CI session cannot grant.
+          # Try the Screen Sharing launch service as well. This may start the
+          # listener but cannot grant macOS Screen Recording/Screen Control TCC
+          # permissions on an unattended hosted runner.
           sudo launchctl enable system/com.apple.screensharing >> "$log" 2>&1 || true
           sudo launchctl kickstart -k system/com.apple.screensharing >> "$log" 2>&1 || true
+
+          screen_capture_blocked=false
+          if grep -Eqi 'Screen recording might be disabled|Screen control might be disabled' "$log"; then
+            screen_capture_blocked=true
+            {
+              echo 'VNC desktop: BLOCKED by macOS Screen Recording/Screen Control authorization.'
+              echo 'Apple kickstart can return exit status 0 and TCP 5900 can listen while screen-capture permission is still denied.'
+              echo 'On this GitHub-hosted runner, enabling that permission requires interactive System Settings authorization or an approved MDM PPPC profile.'
+            } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
           vnc_ready=false
           for _ in $(seq 1 30); do
@@ -199,10 +210,12 @@ jobs:
           } | tee -a "$log" | tee -a "$REPORT_DIR/remote-access.txt"
 
           if [[ "$vnc_ready" == true ]]; then
-            {
-              echo 'VNC transport: TCP 5900 accepts connections on the Tailscale address.'
-              echo 'VNC desktop status: NOT VERIFIED. A headless macOS runner may accept VNC authentication but fail to provide a framebuffer if Screen Recording authorization is unavailable.'
-            } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo 'VNC transport: TCP 5900 accepts connections on the Tailscale address.' | tee -a "$GITHUB_STEP_SUMMARY"
+            if [[ "$screen_capture_blocked" == true ]]; then
+              echo 'VNC result: UNAVAILABLE — macOS explicitly reported that Screen Recording/Screen Control authorization is missing.' | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo 'VNC desktop status: NOT VERIFIED. A port check does not prove that screen capture is authorized.' | tee -a "$GITHUB_STEP_SUMMARY"
           else
             {
               echo 'VNC status: NOT READY. Screen Sharing may require GUI/MDM authorization on this macOS image.'
