@@ -271,3 +271,34 @@ From a device connected to the same Tailscale network, use the reported values:
 - VNC: set the viewer host to `TAILSCALE_IP` and port to `5900`; on Linux with TigerVNC use `vncviewer TAILSCALE_IP::5900` (password is the `VNC_PASSWORD` secret).
 
 The run has a 360-minute hard timeout and cancels any previous session when a new one starts. This remains an ephemeral GitHub-hosted CI machine, not a persistent VM: the Tailscale node and remote access disappear when the job ends.
+
+
+## macOS remote control session
+
+The [macOS Remote Control workflow](.github/workflows/macos-remote-control-session.yml) starts an ephemeral GitHub-hosted macOS runner, connects it to Tailscale, attempts to enable Apple Screen Sharing with VNC authentication, and keeps the session alive for up to 350 minutes. It also attempts optional SSH access. Inbound TCP ports 22 and 5900 are filtered so only Tailscale IPv4 peers can reach the runner's Tailscale address.
+
+### Required secrets
+
+This workflow reuses the Tailscale setup described in [Windows Server 2022 SSH + VNC access](#windows-server-2022-ssh--vnc-access):
+
+- `TAILSCALE_AUTHKEY`: a reusable, ephemeral Tailscale auth key tagged `tag:ci`, pre-approved if device approval is enabled.
+- `VNC_PASSWORD`: exactly 8 ASCII letters or digits, as required by legacy VNC authentication.
+- `REMOTE_PASSWORD` (optional): at least 16 characters, with uppercase, lowercase, numeric, and special characters. If missing or invalid, SSH setup is skipped and does not prevent the VNC attempt.
+
+Ensure your tailnet policy permits your client device to reach `tag:ci` on TCP ports 22 and 5900. Merge the corresponding grant from the Windows section into your existing policy rather than replacing existing rules.
+
+### Start and connect
+
+Open **Actions → macOS — Remote Control Session → Run workflow**. Choose a runner label (defaults to `macos-15-intel`), session duration (up to 350 minutes), and heartbeat interval. The workflow summary reports the runner's Tailscale IPv4 address, macOS username, and whether the SSH and VNC listeners are available.
+
+From a device connected to the same Tailscale network:
+
+- VNC: connect to the reported Tailscale IPv4 address on TCP port `5900`; with TigerVNC on Linux, run `vncviewer TAILSCALE_IP::5900`. Use the `VNC_PASSWORD` secret.
+- On macOS, open `vnc://TAILSCALE_IP` in Screen Sharing.
+- SSH (if configured): `ssh MACOS_USER@TAILSCALE_IP`; use the optional `REMOTE_PASSWORD` secret.
+
+### macOS Screen Sharing limitation
+
+The workflow records setup output and checks whether TCP 5900 is reachable before reporting VNC as ready. Apple's current security behavior means that command-line activation alone may not enable full screen control on every modern macOS image; a VNC connection can be unavailable, black, or view-only if macOS requires authorization through System Settings or MDM. GitHub-hosted runners are ephemeral and do not provide a general MDM enrollment step. If VNC is not ready, download the `macos-remote-session` artifact and inspect `screen-sharing-setup.log`; optional SSH is attempted independently. A listening TCP port is a connectivity check, not proof that macOS granted mouse and keyboard control.
+
+The session has a 360-minute hard job timeout and cancels any previous session when a new macOS session starts. The runner, Tailscale node, and remote access are discarded when the job ends.
