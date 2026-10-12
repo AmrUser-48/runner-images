@@ -285,6 +285,8 @@ This workflow reuses the Tailscale setup described in [Windows Server 2022 SSH +
 - `VNC_PASSWORD`: exactly 8 ASCII letters or digits, as required by legacy VNC authentication.
 - `SSH_PUBLIC_KEY` (optional): your SSH **public** key, copied from a client key file such as `~/.ssh/id_ed25519_macos_runner.pub`. SSH setup installs it in the ephemeral runner user's `~/.ssh/authorized_keys`; the private key must remain on your client. If this secret is missing or invalid, SSH setup is skipped and does not prevent the VNC attempt.
 
+Create a client key on Linux with `ssh-keygen -t ed25519 -a 64 -f ~/.ssh/id_ed25519_macos_runner -C macos-runner`. Copy the contents of `~/.ssh/id_ed25519_macos_runner.pub` (never the private key without the `.pub` suffix) into a repository Actions secret named `SSH_PUBLIC_KEY` under **Settings → Secrets and variables → Actions**. For a completely non-interactive client login, leave the key passphrase empty when `ssh-keygen` asks; protect the private key on your client.
+
 Ensure your tailnet policy permits your client device to reach `tag:ci` on TCP ports 22 and 5900. Merge the corresponding grant from the Windows section into your existing policy rather than replacing existing rules.
 
 ### Start and connect
