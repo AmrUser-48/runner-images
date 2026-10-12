@@ -128,14 +128,14 @@ jobs:
           awk -v ip="$tailnet_ip" '
             BEGIN { inserted=0 }
             !inserted && $0 ~ /^[[:space:]]*anchor[[:space:]]/ && index($0, "com.apple/*") > 0 {
-              printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\\n", ip
+              printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n", ip
               print "block in quick proto tcp from any to any port { 22, 5900 }"
               inserted=1
             }
             { print }
             END {
               if (!inserted) {
-                printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\\n", ip
+                printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n", ip
                 print "block in quick proto tcp from any to any port { 22, 5900 }"
               }
             }
