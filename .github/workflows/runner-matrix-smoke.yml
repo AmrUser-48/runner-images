@@ -241,28 +241,29 @@ jobs:
 
           # Confirm this is an RFB/VNC endpoint, not merely an open TCP port.
           if ! python3 - "$tailnet_ip" <<'PY'
-import socket
-import sys
+          import socket
+          import sys
 
-host = sys.argv[1]
-try:
-    with socket.create_connection((host, 5900), timeout=4) as sock:
-        sock.settimeout(4)
-        greeting = bytearray()
-        while len(greeting) < 12:
-            chunk = sock.recv(12 - len(greeting))
-            if not chunk:
-                break
-            greeting.extend(chunk)
-    if len(greeting) != 12 or not greeting.startswith(b"RFB "):
-        print(f"FAIL: unexpected VNC server greeting: {bytes(greeting)!r}", file=sys.stderr)
-        raise SystemExit(1)
-    print(f"PASS: RFB protocol greeting received: {bytes(greeting).decode('ascii', errors='replace').strip()}")
-except (OSError, TimeoutError) as exc:
-    print(f"FAIL: RFB handshake failed: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-PY
+          host = sys.argv[1]
+          try:
+              with socket.create_connection((host, 5900), timeout=4) as sock:
+                  sock.settimeout(4)
+                  greeting = bytearray()
+                  while len(greeting) < 12:
+                      chunk = sock.recv(12 - len(greeting))
+                      if not chunk:
+                          break
+                      greeting.extend(chunk)
+              if len(greeting) != 12 or not greeting.startswith(b"RFB "):
+                  print(f"FAIL: unexpected VNC server greeting: {bytes(greeting)!r}", file=sys.stderr)
+                  raise SystemExit(1)
+              print(f"PASS: RFB protocol greeting received: {bytes(greeting).decode('ascii', errors='replace').strip()}")
+          except (OSError, TimeoutError) as exc:
+              print(f"FAIL: RFB handshake failed: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
           then
+
             echo 'FAIL: RFB/VNC protocol handshake did not succeed.' | tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
