@@ -246,7 +246,7 @@ jobs:
             ''
             '- Tailscale IPv4: ' + $tailnetIp
             '- SSH: ssh ' + $remoteUser + '@' + $tailnetIp + ' (TCP 22)'
-            '- VNC viewer address: ' + $tailnetIp + ':5900'
+            '- VNC viewer host: ' + $tailnetIp + '; TCP port 5900 (TigerVNC CLI: ' + $tailnetIp + '::5900)'
             '- Windows username: ' + $remoteUser
             '- SSH password: GitHub Actions secret REMOTE_PASSWORD'
             '- VNC password: GitHub Actions secret VNC_PASSWORD'
