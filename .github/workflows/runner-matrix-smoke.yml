@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: runner-matrix-smoke-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   smoke:
@@ -154,10 +154,15 @@ jobs:
 
       - name: Connect macOS runner to Tailscale
         if: matrix.is_macos && steps.remote-precheck.outputs.available == 'true'
+        timeout-minutes: 6
+        continue-on-error: true
+        env:
+          GOWORK: 'off'
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          use-cache: "false"
+          use-cache: "true"
+          log-mode: normal
 
       - name: Attempt private macOS Screen Sharing/VNC
         if: matrix.is_macos && steps.remote-precheck.outputs.available == 'true'
@@ -233,7 +238,35 @@ jobs:
             echo 'FAIL: Screen Sharing/VNC listener did not become reachable within 20 seconds.' | tee -a "$log"
             exit 1
           fi
-          echo 'PASS: TCP 5900 responds on the Tailscale address; this does not independently prove interactive GUI control.' |
+
+          # Confirm this is an RFB/VNC endpoint, not merely an open TCP port.
+          if ! python3 - "$tailnet_ip" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+try:
+    with socket.create_connection((host, 5900), timeout=4) as sock:
+        sock.settimeout(4)
+        greeting = bytearray()
+        while len(greeting) < 12:
+            chunk = sock.recv(12 - len(greeting))
+            if not chunk:
+                break
+            greeting.extend(chunk)
+    if len(greeting) != 12 or not greeting.startswith(b"RFB "):
+        print(f"FAIL: unexpected VNC server greeting: {bytes(greeting)!r}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"PASS: RFB protocol greeting received: {bytes(greeting).decode('ascii', errors='replace').strip()}")
+except (OSError, TimeoutError) as exc:
+    print(f"FAIL: RFB handshake failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+          then
+            echo 'FAIL: RFB/VNC protocol handshake did not succeed.' | tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'PASS: TCP 5900 is reachable and returns an RFB greeting. This still does not prove interactive mouse/keyboard control.' |
             tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload runner diagnostics
