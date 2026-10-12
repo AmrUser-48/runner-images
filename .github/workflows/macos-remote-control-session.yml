@@ -197,6 +197,7 @@ jobs:
           epoch="$(date +%s)"
           if ! sudo sqlite3 -batch "$db" <<SQL
           .timeout 5000
+          .bail on
           BEGIN IMMEDIATE;
           DELETE FROM access
             WHERE client = 'com.apple.screensharing.agent'
