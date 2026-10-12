@@ -221,7 +221,7 @@ jobs:
           ssh_error=''
 
           if [[ -z "${SSH_PUBLIC_KEY:-}" ]]; then
-            echo 'SSH_PUBLIC_KEY is not set; SSH skipped. Add your SSH public key as a repository Actions secret named SSH_PUBLIC_KEY.' | tee "$log"
+            echo 'SSH_PUBLIC_KEY is not set; SSH skipped. Add your public key as a repository Actions secret named SSH_PUBLIC_KEY.' | tee "$log"
             echo 'SSH status: skipped (SSH_PUBLIC_KEY secret is missing).' | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -229,97 +229,12 @@ jobs:
           (
             set -euo pipefail
             remote_user="$(id -un)"
-            remote_home="$HOME"
-            ssh_dir="$remote_home/.ssh"
+            ssh_dir="$HOME/.ssh"
             authorized_keys="$ssh_dir/authorized_keys"
 
-            # Install only the public key. No SSH account password is set or logged.
+            # Install the public key; the private key stays on the client.
             install -d -m 700 "$ssh_dir"
-            printf '%s\\n' "${SSH_PUBLIC_KEY//
-      - name: Publish private connection details
-        shell: bash
-        run: |
-          set -euo pipefail
-          remote_user="$(id -un)"
-          vnc_status='unavailable'
-          ssh_status='unavailable'
-          nc -z -G 2 "$TAILSCALE_IP" 5900 >/dev/null 2>&1 && vnc_status='listening on TCP 5900'
-          nc -z -G 2 "$TAILSCALE_IP" 22 >/dev/null 2>&1 && ssh_status='listening on TCP 22'
-
-          {
-            echo
-            echo '## Private macOS remote access'
-            echo
-            echo "- Runner label: ${{ inputs.runner_label || 'macos-15-intel' }}"
-            echo "- macOS user: $remote_user"
-            echo "- Tailscale IPv4: $TAILSCALE_IP"
-            echo "- Screen Sharing/VNC status: $vnc_status"
-            echo "- SSH status: $ssh_status"
-            echo "- VNC host: $TAILSCALE_IP, TCP port 5900 (password: GitHub Actions secret VNC_PASSWORD)"
-            echo "- macOS Screen Sharing URI: vnc://$TAILSCALE_IP"
-            echo "- SSH: ssh -i ~/.ssh/id_ed25519_macos_runner $remote_user@$TAILSCALE_IP (public-key authentication; private key stays on your client)"
-            echo '- SSH key authentication uses the SSH_PUBLIC_KEY repository secret; no remote account password is required.'
-            echo '- Connect your client device to the same Tailscale network first.'
-            echo '- The workflow filters inbound TCP 22/5900 so only Tailscale IPv4 peers can reach them.'
-            echo '- VNC authentication uses legacy VNC password mode; keep the 8-character password unique and rely on Tailscale ACLs as the network boundary.'
-          } | tee -a "$REPORT_DIR/remote-access.txt" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Keep session active with periodic heartbeats
-        id: session
-        shell: bash
-        timeout-minutes: 355
-        run: |
-          set -euo pipefail
-          session_minutes="${SESSION_MINUTES:-350}"
-          heartbeat_minutes="${HEARTBEAT_MINUTES:-5}"
-          [[ "$session_minutes" =~ ^[0-9]+$ ]] || { echo 'session_minutes must be an integer.' >&2; exit 1; }
-          [[ "$heartbeat_minutes" =~ ^(1|5|10|15)$ ]] || { echo 'heartbeat_minutes must be 1, 5, 10, or 15.' >&2; exit 1; }
-          (( session_minutes >= 1 && session_minutes <= 350 )) || { echo 'session_minutes must be between 1 and 350.' >&2; exit 1; }
-
-          log="$REPORT_DIR/heartbeat.log"
-          started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          start_epoch="$(date +%s)"
-          deadline=$(( start_epoch + session_minutes * 60 ))
-          echo "Started UTC=$started; target minutes=$session_minutes; heartbeat minutes=$heartbeat_minutes" | tee "$log"
-          echo "Session target: $session_minutes minutes; job hard timeout: 360 minutes." | tee -a "$GITHUB_STEP_SUMMARY"
-
-          while true; do
-            now_epoch="$(date +%s)"
-            remaining=$(( deadline - now_epoch ))
-            (( remaining > 0 )) || break
-            sleep_seconds=$(( heartbeat_minutes * 60 ))
-            (( sleep_seconds <= remaining )) || sleep_seconds=$remaining
-            sleep "$sleep_seconds"
-            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            now_epoch="$(date +%s)"
-            remaining_minutes=$(( (deadline - now_epoch + 59) / 60 ))
-            (( remaining_minutes >= 0 )) || remaining_minutes=0
-            line="Heartbeat UTC=$now; remaining_minutes=$remaining_minutes"
-            echo "$line" | tee -a "$log"
-          done
-
-          ended="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          elapsed_seconds=$(( $(date +%s) - start_epoch ))
-          printf 'Ended UTC=%s; elapsed_minutes=%s\n' "$ended" "$(( elapsed_seconds / 60 ))" | tee -a "$log"
-          {
-            echo
-            echo '## macOS session completed'
-            echo "- Started UTC: $started"
-            echo "- Ended UTC: $ended"
-            echo "- Requested duration: $session_minutes minutes"
-            echo "- Heartbeat interval: $heartbeat_minutes minutes"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload macOS session diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-remote-session-${{ github.run_id }}
-          path: ${{ runner.temp }}/macos-remote-session/
-          if-no-files-found: warn
-          retention-days: 1
-          compression-level: 1
-\\r'/}" > "$authorized_keys"
+            printf '%s\n' "$SSH_PUBLIC_KEY" > "$authorized_keys"
             chmod 600 "$authorized_keys"
             ssh-keygen -lf "$authorized_keys" > "$RUNNER_TEMP/ssh-key-fingerprints.txt"
             awk '{ print "Installed SSH public-key fingerprint: " $2 }' "$RUNNER_TEMP/ssh-key-fingerprints.txt"
@@ -369,7 +284,8 @@ jobs:
             echo "- SSH status: $ssh_status"
             echo "- VNC host: $TAILSCALE_IP, TCP port 5900 (password: GitHub Actions secret VNC_PASSWORD)"
             echo "- macOS Screen Sharing URI: vnc://$TAILSCALE_IP"
-            echo "- SSH: ssh $remote_user@$TAILSCALE_IP (password: optional secret REMOTE_PASSWORD)"
+            echo "- SSH: ssh -i ~/.ssh/id_ed25519_macos_runner $remote_user@$TAILSCALE_IP (public-key authentication; private key stays on the client)"
+            echo '- SSH key authentication uses the SSH_PUBLIC_KEY repository secret; no remote account password is required.'
             echo '- Connect your client device to the same Tailscale network first.'
             echo '- The workflow filters inbound TCP 22/5900 so only Tailscale IPv4 peers can reach them.'
             echo '- VNC authentication uses legacy VNC password mode; keep the 8-character password unique and rely on Tailscale ACLs as the network boundary.'
