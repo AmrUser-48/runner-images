@@ -99,43 +99,54 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           use-cache: "false"
 
-      - name: Enable Windows OpenSSH Server (non-blocking)
+      - name: Enable Windows OpenSSH Server with public-key authentication (non-blocking)
         id: ssh
         continue-on-error: true
         shell: pwsh
         env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
           REMOTE_PASSWORD: ${{ secrets.REMOTE_PASSWORD }}
         run: |
-          # SSH is optional: failures are recorded, but must never prevent VNC setup.
+          # SSH failures are recorded, but must never prevent VNC setup.
           $ErrorActionPreference = 'Stop'
           $sshStatus = 'failed'
           $sshError = $null
           try {
-            # All SSH-only validation stays inside this try/catch so it cannot block VNC.
-            if ([string]::IsNullOrWhiteSpace($env:REMOTE_PASSWORD)) {
-              throw 'REMOTE_PASSWORD secret is missing; SSH cannot be configured.'
+            if ([string]::IsNullOrWhiteSpace($env:SSH_PUBLIC_KEY)) {
+              throw 'SSH_PUBLIC_KEY repository Actions secret is missing.'
             }
-            if ($env:REMOTE_PASSWORD.Length -lt 16) {
-              throw 'REMOTE_PASSWORD must be at least 16 characters long.'
+            $publicKey = $env:SSH_PUBLIC_KEY.Trim()
+            if ($publicKey -match '[\r\n]') {
+              throw 'SSH_PUBLIC_KEY must contain exactly one OpenSSH public-key line.'
             }
-            if ($env:REMOTE_PASSWORD -notmatch '[A-Z]' -or
-                $env:REMOTE_PASSWORD -notmatch '[a-z]' -or
-                $env:REMOTE_PASSWORD -notmatch '[0-9]' -or
-                $env:REMOTE_PASSWORD -notmatch '[^A-Za-z0-9]') {
-              throw 'REMOTE_PASSWORD must contain uppercase, lowercase, numeric, and special characters.'
+            if ($publicKey -notmatch '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+)\s+[A-Za-z0-9+/]+={0,3}(\s+.*)?$') {
+              throw 'SSH_PUBLIC_KEY does not look like a supported OpenSSH public key.'
             }
+
             $remoteUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split([char]92)[-1]
-            if ($remoteUser.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($remoteUser, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-              throw 'REMOTE_PASSWORD must not contain the Windows account name.'
-            }
             $localUser = Get-LocalUser -Name $remoteUser -ErrorAction Stop
-            if (-not [string]::IsNullOrWhiteSpace($localUser.FullName)) {
-              $nameParts = $localUser.FullName -split '[\\s,\.\-_#\t]+'
-              foreach ($part in $nameParts) {
-                if ($part.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($part, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                  throw 'REMOTE_PASSWORD must not contain any part of the Windows account full name.'
+
+            # Preserve the optional Windows account password for logging into the
+            # desktop; SSH remote access itself will use public-key authentication.
+            if (-not [string]::IsNullOrWhiteSpace($env:REMOTE_PASSWORD)) {
+              if ($env:REMOTE_PASSWORD.Length -lt 16 -or
+                  $env:REMOTE_PASSWORD -notmatch '[A-Z]' -or
+                  $env:REMOTE_PASSWORD -notmatch '[a-z]' -or
+                  $env:REMOTE_PASSWORD -notmatch '[0-9]' -or
+                  $env:REMOTE_PASSWORD -notmatch '[^A-Za-z0-9]') {
+                throw 'REMOTE_PASSWORD must be at least 16 characters and contain uppercase, lowercase, numeric, and special characters.'
+              }
+              if ($remoteUser.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($remoteUser, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw 'REMOTE_PASSWORD must not contain the Windows account name.'
+              }
+              if (-not [string]::IsNullOrWhiteSpace($localUser.FullName)) {
+                foreach ($part in ($localUser.FullName -split '[\s,\.\-_#\t]+')) {
+                  if ($part.Length -ge 3 -and $env:REMOTE_PASSWORD.IndexOf($part, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    throw 'REMOTE_PASSWORD must not contain any part of the Windows account full name.'
+                  }
                 }
               }
+              Set-LocalUser -Name $remoteUser -Password (ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force)
             }
 
             $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
@@ -154,32 +165,35 @@ jobs:
               throw "OpenSSH Server executable not found: $sshdExe"
             }
 
-            $securePassword = ConvertTo-SecureString $env:REMOTE_PASSWORD -AsPlainText -Force
-            Set-LocalUser -Name $remoteUser -Password $securePassword
-            if (-not $localUser.Enabled) { Enable-LocalUser -Name $remoteUser }
-
+            # Windows OpenSSH uses this shared authorized-keys file for
+            # administrator accounts. Limit its ACL to SYSTEM and Administrators.
             $sshDir = Join-Path $env:ProgramData 'ssh'
-            $configPath = Join-Path $sshDir 'sshd_config'
             New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+            $adminKeys = Join-Path $sshDir 'administrators_authorized_keys'
+            Set-Content -LiteralPath $adminKeys -Value $publicKey -Encoding ascii
+            & icacls.exe $adminKeys /inheritance:r /grant '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not set secure ACLs on $adminKeys."
+            }
+            $sshKeygen = Join-Path $openSshDir 'ssh-keygen.exe'
+            $fingerprintOutput = & $sshKeygen -lf $adminKeys 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "The installed SSH public key could not be parsed: $fingerprintOutput"
+            }
+            $fingerprint = ($fingerprintOutput | Out-String).Trim()
+            "Installed SSH public key: $fingerprint" |
+              Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'remote-access.txt') |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-            # Some images ship only sshd_config_default. Prefer it; otherwise create a minimal config.
+            $configPath = Join-Path $sshDir 'sshd_config'
             if (-not (Test-Path -LiteralPath $configPath)) {
               $defaultConfig = Join-Path $openSshDir 'sshd_config_default'
               if (Test-Path -LiteralPath $defaultConfig) {
                 Copy-Item -LiteralPath $defaultConfig -Destination $configPath -Force
               } else {
-                @(
-                  'Port 22'
-                  'AddressFamily any'
-                  'ListenAddress 0.0.0.0'
-                  'PubkeyAuthentication yes'
-                  'PasswordAuthentication yes'
-                  'Subsystem sftp sftp-server.exe'
-                ) | Set-Content -LiteralPath $configPath -Encoding ascii
+                @('Port 22','AddressFamily any','ListenAddress 0.0.0.0','Subsystem sftp sftp-server.exe') |
+                  Set-Content -LiteralPath $configPath -Encoding ascii
               }
-            }
-            if (-not (Test-Path -LiteralPath $configPath)) {
-              throw "Unable to create OpenSSH configuration: $configPath"
             }
 
             $config = Get-Content -LiteralPath $configPath -Raw
@@ -191,15 +205,36 @@ jobs:
               $prefix = $config
               $suffix = ''
             }
-            $passwordAuthPattern = '(?im)^[ \t]*#?[ \t]*PasswordAuthentication[ \t]+\S+.*$'
-            if ([regex]::IsMatch($prefix, $passwordAuthPattern)) {
-              $prefix = [regex]::Replace($prefix, $passwordAuthPattern, 'PasswordAuthentication yes')
-            } else {
-              $prefix = $prefix.TrimEnd() + [Environment]::NewLine + 'PasswordAuthentication yes' + [Environment]::NewLine
-            }
-            Set-Content -LiteralPath $configPath -Value ($prefix + $suffix) -Encoding ascii
 
-            # Keep SSH private to the Tailscale address range.
+            # Key-only SSH: do not silently fall back to account-password prompts.
+            foreach ($setting in @(
+              @{ Name = 'PubkeyAuthentication'; Value = 'yes' },
+              @{ Name = 'PasswordAuthentication'; Value = 'no' },
+              @{ Name = 'KbdInteractiveAuthentication'; Value = 'no' }
+            )) {
+              $pattern = '(?im)^[ \t]*#?[ \t]*' + [regex]::Escape($setting.Name) + '[ \t]+\S+.*$'
+              if ([regex]::IsMatch($prefix, $pattern)) {
+                $prefix = [regex]::Replace($prefix, $pattern, ($setting.Name + ' ' + $setting.Value))
+              } else {
+                $prefix = $prefix.TrimEnd() + [Environment]::NewLine + $setting.Name + ' ' + $setting.Value + [Environment]::NewLine
+              }
+            }
+
+            # Match this runner account before the stock administrator Match block.
+            $userMatch = @(
+              "Match User $remoteUser"
+              '    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
+              '    PubkeyAuthentication yes'
+              '    PasswordAuthentication no'
+              '    KbdInteractiveAuthentication no'
+              ''
+            ) -join [Environment]::NewLine
+            Set-Content -LiteralPath $configPath -Value ($prefix.TrimEnd() + [Environment]::NewLine + $userMatch + $suffix) -Encoding ascii
+
+            & $sshdExe -t -f $configPath
+            if ($LASTEXITCODE -ne 0) { throw 'OpenSSH configuration validation failed.' }
+
+            # Keep SSH private to the Tailscale IPv4 range.
             Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue |
               Disable-NetFirewallRule -ErrorAction SilentlyContinue
             Get-NetFirewallRule -DisplayName 'SSH via Tailscale only' -ErrorAction SilentlyContinue |
@@ -221,19 +256,15 @@ jobs:
               }
               Start-Sleep -Seconds 1
             }
-            if (-not $sshReady) {
-              Get-Service -Name sshd -ErrorAction SilentlyContinue |
-                Format-List * | Out-String |
-                Add-Content -LiteralPath (Join-Path $env:REPORT_DIR 'ssh-diagnostics.txt')
-              throw 'OpenSSH service did not listen on TCP port 22 within 30 seconds.'
-            }
+            if (-not $sshReady) { throw 'OpenSSH service did not listen on TCP port 22 within 30 seconds.' }
 
             $sshStatus = 'passed'
-            "SSH configured for $remoteUser on TCP 22; firewall limited to Tailscale IPv4." |
-              Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'remote-access.txt')
+            "SSH key authentication configured for $remoteUser on TCP 22; password authentication disabled; firewall limited to Tailscale IPv4." |
+              Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'remote-access.txt') |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           } catch {
             $sshError = $_.Exception.Message
-            Write-Warning "SSH setup failed; continuing to TightVNC installation. Reason: $sshError"
+            Write-Warning "SSH key setup failed; continuing to TightVNC installation. Reason: $sshError"
             "SSH setup FAILED: $sshError" |
               Tee-Object -FilePath (Join-Path $env:REPORT_DIR 'ssh-diagnostics.txt')
           } finally {
