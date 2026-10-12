@@ -1,0 +1,247 @@
+name: Runner Matrix — Smoke Test
+run-name: "Runner smoke test • ${{ github.event_name }} • ${{ github.sha }}"
+
+on:
+  push:
+    paths:
+      - '.github/workflows/runner-matrix-smoke.yml'
+      - '.github/workflows/macos-remote-control-session.yml'
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-matrix-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: "${{ matrix.runner_label }} smoke test"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_label: ubuntu-24.04
+            family: unix
+            platform: Linux
+            architecture: x64
+            is_macos: false
+          - runner_label: ubuntu-24.04-arm
+            family: unix
+            platform: Linux
+            architecture: arm64
+            is_macos: false
+          - runner_label: windows-2022
+            family: windows
+            platform: Windows
+            architecture: x64
+            is_macos: false
+          - runner_label: windows-2025
+            family: windows
+            platform: Windows
+            architecture: x64
+            is_macos: false
+          - runner_label: windows-11-arm
+            family: windows
+            platform: Windows
+            architecture: arm64
+            is_macos: false
+          - runner_label: macos-15-intel
+            family: unix
+            platform: macOS
+            architecture: x64
+            is_macos: true
+          - runner_label: macos-26-intel
+            family: unix
+            platform: macOS
+            architecture: x64
+            is_macos: true
+          - runner_label: macos-15
+            family: unix
+            platform: macOS
+            architecture: arm64
+            is_macos: true
+          - runner_label: macos-26
+            family: unix
+            platform: macOS
+            architecture: arm64
+            is_macos: true
+    runs-on: ${{ matrix.runner_label }}
+    timeout-minutes: 12
+
+    steps:
+      - name: Capture runner identity and verify baseline tools (Unix)
+        if: matrix.family == 'unix'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/runner-smoke"
+          mkdir -p "$report_dir"
+          {
+            echo "Runner label: ${{ matrix.runner_label }}"
+            echo "Expected platform: ${{ matrix.platform }}"
+            echo "Expected architecture: ${{ matrix.architecture }}"
+            echo "Actual architecture: $(uname -m)"
+            echo "Runner OS: $RUNNER_OS"
+            echo "Runner name: $RUNNER_NAME"
+            uname -a
+            command -v bash
+            command -v curl
+            command -v git
+            df -h /
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sw_vers
+              test -x /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+              echo 'Apple Remote Desktop kickstart tool exists.'
+            fi
+          } | tee "$report_dir/runner-report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          actual_arch="$(uname -m)"
+          case "${{ matrix.architecture }}" in
+            x64) [[ "$actual_arch" == "x86_64" ]] ;;
+            arm64) [[ "$actual_arch" == "arm64" || "$actual_arch" == "aarch64" ]] ;;
+            *) echo "Unknown expected architecture." >&2; exit 1 ;;
+          esac
+
+      - name: Capture runner identity and verify baseline tools (Windows)
+        if: matrix.family == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reportDir = Join-Path $env:RUNNER_TEMP 'runner-smoke'
+          New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM') { 'arm64' } else { 'x64' }
+          $report = @(
+            "Runner label: ${{ matrix.runner_label }}"
+            "Expected platform: ${{ matrix.platform }}"
+            "Expected architecture: ${{ matrix.architecture }}"
+            "Actual architecture: $arch"
+            "Runner OS: $env:RUNNER_OS"
+            "Runner name: $env:RUNNER_NAME"
+            (Get-ComputerInfo | Select-Object -ExpandProperty WindowsProductName)
+            (Get-Date -Format o)
+          )
+          $report | Tee-Object -FilePath (Join-Path $reportDir 'runner-report.txt') |
+            Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($arch -ne '${{ matrix.architecture }}') {
+            throw "Architecture mismatch: expected ${{ matrix.architecture }}, got $arch"
+          }
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git is missing.' }
+          if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { throw 'curl.exe is missing.' }
+
+      - name: Check macOS remote-control secrets
+        if: matrix.is_macos
+        id: remote-precheck
+        shell: bash
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/runner-smoke"
+          mkdir -p "$report_dir"
+          if [[ -n "${TAILSCALE_AUTHKEY:-}" && "${VNC_PASSWORD:-}" =~ ^[A-Za-z0-9]{8}$ ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo 'Remote-control secrets are present; proceeding with a short Tailscale + Screen Sharing test.' |
+              tee -a "$report_dir/remote-control-test.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Remote-control setup skipped: TAILSCALE_AUTHKEY or a valid 8-character VNC_PASSWORD secret is missing.' |
+              tee -a "$report_dir/remote-control-test.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Connect macOS runner to Tailscale
+        if: matrix.is_macos && steps.remote-precheck.outputs.available == 'true'
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: "false"
+
+      - name: Attempt private macOS Screen Sharing/VNC
+        if: matrix.is_macos && steps.remote-precheck.outputs.available == 'true'
+        id: vnc-test
+        continue-on-error: true
+        shell: bash
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -u
+          report_dir="$RUNNER_TEMP/runner-smoke"
+          mkdir -p "$report_dir"
+          log="$report_dir/remote-control-test.txt"
+          kickstart='/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart'
+          ts_bin="$(command -v tailscale || true)"
+          [[ -n "$ts_bin" ]] || ts_bin='/opt/homebrew/bin/tailscale'
+          [[ -x "$ts_bin" ]] || ts_bin='/usr/local/bin/tailscale'
+          tailnet_ip="$("$ts_bin" ip -4 2>/dev/null | awk '/^100\./ { print; exit }')"
+
+          if [[ ! "$tailnet_ip" =~ ^100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo 'FAIL: unable to obtain Tailscale IPv4 address.' | tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Tailscale IPv4: $tailnet_ip" | tee -a "$log"
+
+          # Apply quick-match rules before Apple's dynamic filter anchor.
+          pf_temp="$RUNNER_TEMP/pf-remote-control.conf"
+          awk -v ip="$tailnet_ip" '
+            BEGIN { inserted=0 }
+            !inserted && $0 ~ /^[[:space:]]*anchor[[:space:]]/ && index($0, "com.apple/*") > 0 {
+              printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n", ip
+              print "block in quick proto tcp from any to any port { 22, 5900 }"
+              inserted=1
+            }
+            { print }
+            END {
+              if (!inserted) {
+                printf "pass in quick inet proto tcp from 100.64.0.0/10 to %s port { 22, 5900 } keep state\n", ip
+                print "block in quick proto tcp from any to any port { 22, 5900 }"
+              }
+            }
+          ' /etc/pf.conf > "$pf_temp"
+
+          if ! sudo pfctl -nf "$pf_temp" >> "$log" 2>&1; then
+            echo 'FAIL: PF configuration did not validate.' | tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          sudo pfctl -f "$pf_temp" >> "$log" 2>&1 || true
+          if ! sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+            sudo pfctl -E >> "$log" 2>&1 || true
+          fi
+
+          if ! sudo "$kickstart" -activate -configure -users "$(id -un)" -access -on -privs -all \
+               -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" \
+               -restart -agent >> "$log" 2>&1; then
+            echo 'WARN: kickstart returned a failure; checking whether TCP 5900 is nevertheless available.' |
+              tee -a "$log"
+          fi
+          sudo launchctl enable system/com.apple.screensharing >> "$log" 2>&1 || true
+          sudo launchctl kickstart -k system/com.apple.screensharing >> "$log" 2>&1 || true
+
+          ready=false
+          for _ in $(seq 1 20); do
+            if nc -z -G 2 "$tailnet_ip" 5900 >/dev/null 2>&1; then ready=true; break; fi
+            sleep 1
+          done
+          {
+            echo "Screen Sharing TCP 5900 reachable on Tailscale address: $ready"
+            sudo lsof -nP -iTCP:5900 -sTCP:LISTEN 2>/dev/null || true
+          } | tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$ready" != true ]]; then
+            echo 'FAIL: Screen Sharing/VNC listener did not become reachable within 20 seconds.' | tee -a "$log"
+            exit 1
+          fi
+          echo 'PASS: TCP 5900 responds on the Tailscale address; this does not independently prove interactive GUI control.' |
+            tee -a "$log" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-smoke-${{ matrix.runner_label }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/runner-smoke/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 1
