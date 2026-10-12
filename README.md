@@ -229,3 +229,9 @@ Please create an issue and get an approval from us to add this tool to the image
 We strongly encourage customers to build their own images using the main branch.
 This repository contains multiple branches and releases that serve as document milestones to reflect what software is installed in the images at certain point of time. Current builds are not idempotent and if one tries to build a runner image using the specific tag it is not guaranteed that the build will succeed.
 </details>
+
+## Windows Server 2022 long session
+
+The [Windows Server 2022 long-session workflow](.github/workflows/windows-server-2022-long-session.yml) runs on the GitHub-hosted `windows-2022` image. The job timeout is set to the hosted-runner maximum of **360 minutes**; the default keepalive lasts 350 minutes so there is time to write diagnostics and upload the session report. Run it manually from **Actions → Windows Server 2022 — Long Session → Run workflow** to choose the duration and heartbeat interval.
+
+This is an ephemeral CI runner, not a persistent VM or remote desktop. It does not enable inbound RDP or create a remote-access tunnel; the host is discarded when the job ends.
