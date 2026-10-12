@@ -95,10 +95,12 @@ jobs:
           } | tee "$report_dir/runner-report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Connect runner to Tailscale
+        env:
+          GOWORK: 'off'
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          use-cache: "false"
+          use-cache: "true"
 
       - name: Restrict remote-access ports to Tailscale
         id: network
